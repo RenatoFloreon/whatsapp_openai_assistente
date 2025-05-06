@@ -30,8 +30,8 @@ const WHATSAPP_MAX_MESSAGE_LENGTH = parseInt(WHATSAPP_MAX_MESSAGE_LENGTH_ENV) ||
 const POLLING_TIMEOUT_MS = 60000; // Max time to wait for Assistant run (60 seconds)
 const POLLING_INTERVAL_MS = 2000; // Interval between polling checks (2 seconds) - increased slightly
 
-const WELCOME_MESSAGE_1 = ENV_WELCOME_MESSAGE_1 || "Olá! Sou seu assistente virtual. Estou aqui para ajudar com suas dúvidas e solicitações.";
-const WELCOME_MESSAGE_2 = ENV_WELCOME_MESSAGE_2 || "Para começar, por favor, descreva sua dúvida ou o que você precisa.";
+const WELCOME_MESSAGE_1 = ENV_WELCOME_MESSAGE_1 || "Olá! Você está conversando com uma Inteligência Artificial experimental, e, portanto, podem acontecer erros.";
+const WELCOME_MESSAGE_2 = ENV_WELCOME_MESSAGE_2 || "Fique tranquilo(a) que seus dados estão protegidos, pois só consigo manter a memória da nossa conversa por 12 horas, depois o chat é reiniciado e os dados, apagados.";
 const PROCESSING_MESSAGE = ENV_PROCESSING_MESSAGE || "Estou processando sua solicitação, aguarde um momento...";
 
 // User States for Redis
