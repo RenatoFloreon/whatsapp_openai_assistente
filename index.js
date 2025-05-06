@@ -1,7 +1,8 @@
 console.log("[INDEX_JS_TOP_LEVEL] Script execution started at " + new Date().toISOString());
 require("dotenv").config();
 const express = require("express");
-const axios = require("axios");
+// const axios = require("axios"); // Axios removido, substituído por node-fetch
+const fetch = require("node-fetch"); // Adicionado node-fetch
 const OpenAI = require("openai");
 const Redis = require("ioredis");
 
@@ -21,7 +22,8 @@ const {
     WHATSAPP_MAX_MESSAGE_LENGTH: WHATSAPP_MAX_MESSAGE_LENGTH_ENV,
     WELCOME_MESSAGE_1: ENV_WELCOME_MESSAGE_1,
     WELCOME_MESSAGE_2: ENV_WELCOME_MESSAGE_2,
-    PROCESSING_MESSAGE: ENV_PROCESSING_MESSAGE
+    PROCESSING_MESSAGE: ENV_PROCESSING_MESSAGE,
+    FETCH_TIMEOUT_MS: ENV_FETCH_TIMEOUT_MS // Nova variável de ambiente para timeout do fetch
 } = process.env;
 
 // --- Constants ---
@@ -30,6 +32,7 @@ const THREAD_EXPIRY_MILLISECONDS = THREAD_EXPIRY_SECONDS * 1000;
 const WHATSAPP_MAX_MESSAGE_LENGTH = parseInt(WHATSAPP_MAX_MESSAGE_LENGTH_ENV) || 4000;
 const POLLING_TIMEOUT_MS = 60000; // Max time to wait for Assistant run (60 seconds)
 const POLLING_INTERVAL_MS = 2000; // Interval between polling checks (2 seconds)
+const FETCH_TIMEOUT_MS = parseInt(ENV_FETCH_TIMEOUT_MS) || 20000; // Timeout para chamadas fetch (20 segundos por defeito)
 
 const WELCOME_MESSAGE_1 = ENV_WELCOME_MESSAGE_1 || "Olá! Você está conversando com uma Inteligência Artificial experimental, e, portanto, podem acontecer erros.";
 const WELCOME_MESSAGE_2 = ENV_WELCOME_MESSAGE_2 || "Fique tranquilo(a) que seus dados estão protegidos, pois só consigo manter a memória da nossa conversa por 12 horas, depois o chat é reiniciado e os dados, apagados.";
@@ -62,10 +65,6 @@ const redis = new Redis(REDIS_URL, {
     maxRetriesPerRequest: 3,
     connectTimeout: 10000,
     showFriendlyErrorStack: true,
-    // Adicionar um timeout para comandos pode ser útil, mas ioredis lida com isso internamente com connectTimeout
-    // e timeouts de retry. Se problemas persistirem, pode-se explorar `commandTimeout`.
-    // commandTimeout: 5000, // Exemplo: 5 segundos para um comando Redis
-    // lazyConnect: true, // Para conectar apenas quando o primeiro comando for emitido, pode ajudar a isolar problemas de conexão inicial
 });
 
 redis.on("connect", () => console.log("[REDIS_EVENT] Conectado com sucesso!"));
@@ -95,21 +94,9 @@ function safeLogError(error, additionalContext = {}) {
         if (error.code) {
             logObject.code = error.code;
         }
-        if (error.isAxiosError) {
-            if (error.config) {
-                logObject.axios_config = {
-                    url: error.config.url,
-                    method: error.config.method,
-                    timeout: error.config.timeout,
-                };
-            }
-            if (error.response) {
-                logObject.axios_response = {
-                    status: error.response.status,
-                    statusText: error.response.statusText,
-                    data: error.response.data ? JSON.stringify(error.response.data).substring(0, 200) + "..." : undefined,
-                };
-            }
+        // Specific handling for node-fetch AbortError
+        if (error.name === "AbortError") {
+            logObject.details = "Request timed out (AbortError from fetch)";
         }
     } else {
         try {
@@ -139,7 +126,8 @@ app.get("/webhook", (req, res) => {
 
 // --- Handle Incoming Messages --- 
 app.post("/webhook", async (req, res) => {
-    console.log(`[WEBHOOK_HANDLER_START] [${req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from || "unknown_sender"}] POST /webhook iniciado.`);
+    const senderId = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from || "unknown_sender";
+    console.log(`[WEBHOOK_HANDLER_START] [${senderId}] POST /webhook iniciado.`);
     console.log("[WEBHOOK_BODY] Full request body (first 500 chars):", JSON.stringify(req.body, null, 2).substring(0, 500));
     
     const body = req.body;
@@ -154,7 +142,7 @@ app.post("/webhook", async (req, res) => {
 
     if (!messageEntry) {
         console.log("[WEBHOOK] Notificação do WhatsApp sem entrada de mensagem válida. Ignorando.");
-        res.sendStatus(200);
+        res.sendStatus(200); // Respond early as per WhatsApp best practices
         return;
     }
 
@@ -175,8 +163,6 @@ app.post("/webhook", async (req, res) => {
             console.log(`[REDIS_GET_SUCCESS] [${from}] Estado recuperado do Redis para ${userStateKey}: ${userState}`);
         } catch (redisError) {
             console.error(`[REDIS_GET_ERROR] [${from}] Erro ao tentar obter ${userStateKey} do Redis:`, safeLogError(redisError, { from, userStateKey }));
-            // Decide if you want to proceed with a default state or abort
-            // For now, let it proceed, userState will be null, potentially triggering welcome flow
         }
 
         console.log(`[DEBUG] [${from}] Ponto B - Após consultar Redis. messageType: ${messageType}, userState: ${userState}`);
@@ -228,7 +214,7 @@ app.post("/webhook", async (req, res) => {
     } catch (error) {
         console.error(`[WEBHOOK_MAIN_CATCH] [${from}] Erro NÃO TRATADO no processamento principal do webhook:`, safeLogError(error, { from }));
     }
-    console.log(`[WEBHOOK_HANDLER_END] [${from || "unknown_sender"}] POST /webhook concluído.`);
+    console.log(`[WEBHOOK_HANDLER_END] [${senderId}] POST /webhook concluído.`);
 });
 
 // --- Helper Functions ---
@@ -288,8 +274,6 @@ async function getOrCreateThread(from, userThreadDataKey) {
         console.log(`[REDIS_SET_SUCCESS] [${from}] Dados do tópico ${threadId} atualizados/salvos em ${userThreadDataKey}.`);
     } catch (error) {
         console.error(`[REDIS_SET_THREAD_ERROR] [${from}] Erro ao salvar dados do tópico ${userThreadDataKey}:`, safeLogError(error, { from, userThreadDataKey, threadId }));
-        // Não retorna null aqui, pois o threadId foi obtido/criado, apenas o save no Redis falhou.
-        // O impacto é que na próxima vez pode criar um novo thread se este save falhar consistentemente.
     }
     console.log(`[GET_OR_CREATE_THREAD] [${from}] Concluído. Retornando threadId: ${threadId}`);
     return threadId;
@@ -335,7 +319,7 @@ async function handleOpenAICalls(text, threadId, assistantId, from) {
                 console.log(`[OPENAI_MSG_RECEIVED] [${from}] [Thread: ${threadId}] Conteúdo da IA: \"${aiMessageContent.substring(0, 100)}\"...`);
                 return aiMessageContent;
             } else {
-                console.error(`[OPENAI_NO_ASSISTANT_MSG] [${from}] [Thread: ${threadId}] Nenhuma mensagem de texto da IA encontrada para run ${run.id}. Mensagens:`, allMessages.data.slice(0,5).map(m => ({id: m.id, role: m.role, run_id: m.run_id, type: m.content[0]?.type }) ));
+                console.error(`[OPENAI_NO_ASSISTANT_MSG] [${from}] [Thread: ${threadId}] Nenhuma mensagem de texto da IA encontrada para run ${run.id}.`);
                 await sendWhatsappMessage(from, "Não consegui obter uma resposta formatada corretamente da IA desta vez (mensagem vazia ou não encontrada).");
                 return null;
             }
@@ -365,37 +349,50 @@ async function sendWhatsappMessage(to, text) {
         messageChunks.push(text.substring(i, i + WHATSAPP_MAX_MESSAGE_LENGTH));
     }
 
-    console.log(`[WHATSAPP_SEND_PREPARE] [${to}] Preparando para enviar ${messageChunks.length} bloco(s).`);
+    console.log(`[WHATSAPP_SEND_PREPARE] [${to}] Preparando para enviar ${messageChunks.length} bloco(s) usando fetch. Timeout: ${FETCH_TIMEOUT_MS}ms`);
 
     for (let i = 0; i < messageChunks.length; i++) {
         const chunk = messageChunks[i];
         const url = `https://graph.facebook.com/v19.0/${WHATSAPP_PHONE_ID}/messages`;
-        const data = {
+        const payload = {
             messaging_product: "whatsapp",
             to: to,
             type: "text",
             text: { body: chunk },
         };
         
-        const AXIOS_TIMEOUT = 15000; // Mantido o timeout de 15s para chamadas ao WhatsApp
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
         try {
-            console.log(`[WHATSAPP_SEND_ATTEMPT] [${to}] Enviando bloco ${i + 1}/${messageChunks.length} para ${url}. Conteúdo (primeiros 50 chars): \"${chunk.substring(0,50)}\"... Timeout: ${AXIOS_TIMEOUT}ms`);
-            const response = await axios.post(url, data, {
+            console.log(`[WHATSAPP_SEND_ATTEMPT_FETCH] [${to}] Enviando bloco ${i + 1}/${messageChunks.length} para ${url}. Conteúdo (primeiros 50 chars): \"${chunk.substring(0,50)}\"...`);
+            const response = await fetch(url, {
+                method: "POST",
+                body: JSON.stringify(payload),
                 headers: {
                     "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
                     "Content-Type": "application/json",
                 },
-                timeout: AXIOS_TIMEOUT 
+                signal: controller.signal
             });
-            console.log(`[WHATSAPP_SEND_SUCCESS] [${to}] Bloco ${i + 1}/${messageChunks.length} enviado. Status: ${response.status}. Resposta (primeiros 100 chars): ${JSON.stringify(response.data).substring(0,100)}...`);
+            clearTimeout(timeoutId);
+
+            const responseBody = await response.json().catch(() => ({})); // Tenta parsear JSON, senão objeto vazio
+
+            if (response.ok) {
+                console.log(`[WHATSAPP_SEND_SUCCESS_FETCH] [${to}] Bloco ${i + 1}/${messageChunks.length} enviado. Status: ${response.status}. Resposta: ${JSON.stringify(responseBody).substring(0,100)}...`);
+            } else {
+                console.error(`[WHATSAPP_SEND_ERROR_FETCH] [${to}] Erro HTTP ao enviar bloco ${i + 1}/${messageChunks.length}. Status: ${response.status} ${response.statusText}. Resposta:`, safeLogError(responseBody, {to, chunk_info: `Bloco ${i+1}/${messageChunks.length}`}));
+                return false; // Interrompe se um bloco falhar
+            }
+
         } catch (error) {
-            console.error(`[WHATSAPP_SEND_ERROR] [${to}] Erro ao enviar bloco ${i + 1}/${messageChunks.length}:`, safeLogError(error, { to, chunk_info: `Bloco ${i+1}/${messageChunks.length}` }));
-            
-            if (error.code === "ECONNABORTED") {
-                console.error(`[WHATSAPP_SEND_TIMEOUT] [${to}] TIMEOUT (ECONNABORTED) ao enviar bloco ${i + 1}/${messageChunks.length} após ${AXIOS_TIMEOUT}ms.`);
+            clearTimeout(timeoutId);
+            console.error(`[WHATSAPP_SEND_CATCH_ERROR_FETCH] [${to}] Erro ao enviar bloco ${i + 1}/${messageChunks.length} com fetch:`, safeLogError(error, { to, chunk_info: `Bloco ${i+1}/${messageChunks.length}` }));
+            if (error.name === "AbortError") {
+                console.error(`[WHATSAPP_SEND_TIMEOUT_FETCH] [${to}] TIMEOUT (AbortError) ao enviar bloco ${i + 1}/${messageChunks.length} após ${FETCH_TIMEOUT_MS}ms.`);
             } else if (error.code === "ENOTFOUND" || error.code === "EAI_AGAIN") {
-                 console.error(`[WHATSAPP_SEND_DNS_ERROR] [${to}] ERRO DE DNS/REDE (Código: ${error.code}) ao tentar resolver graph.facebook.com.`);
+                 console.error(`[WHATSAPP_SEND_DNS_ERROR_FETCH] [${to}] ERRO DE DNS/REDE (Código: ${error.code}) ao tentar resolver graph.facebook.com.`);
             }
             return false; 
         }
@@ -408,24 +405,18 @@ const serverPort = PORT || 3000;
 app.listen(serverPort, () => {
     console.log(`[SERVER] Servidor Express escutando na porta ${serverPort}`);
     console.log(`[SERVER] Webhook URL: /webhook`);
-    // Adicionar mais logs de inicialização para variáveis de ambiente críticas
     console.log(`[ENV_CHECK] VERIFY_TOKEN: ${VERIFY_TOKEN ? "Configurado" : "NÃO CONFIGURADO!"}`);
     console.log(`[ENV_CHECK] WHATSAPP_TOKEN: ${WHATSAPP_TOKEN ? "Configurado" : "NÃO CONFIGURADO!"}`);
     console.log(`[ENV_CHECK] WHATSAPP_PHONE_ID: ${WHATSAPP_PHONE_ID ? "Configurado" : "NÃO CONFIGURADO!"}`);
     console.log(`[ENV_CHECK] OPENAI_API_KEY: ${OPENAI_API_KEY ? "Configurado" : "NÃO CONFIGURADO!"}`);
     console.log(`[ENV_CHECK] ASSISTANT_ID: ${ASSISTANT_ID ? "Configurado" : "NÃO CONFIGURADO!"}`);
     console.log(`[ENV_CHECK] REDIS_URL: ${REDIS_URL ? "Configurado (início: " + REDIS_URL.substring(0,20) + "...)" : "NÃO CONFIGURADO!"}`);
+    console.log(`[ENV_CHECK] FETCH_TIMEOUT_MS: ${FETCH_TIMEOUT_MS} (Padrão 20000ms se não definido em .env)`);
 });
 
 // Graceful Shutdown
 function gracefulShutdown(signal) {
   console.log(`[SERVER_SHUTDOWN] Sinal ${signal} recebido. Fechando conexões...`);
-  // Fechar o servidor HTTP primeiro para não aceitar novas conexões
-  const server = app.listen(); // Isto é um placeholder, o servidor já está a escutar.
-                               // Precisamos de uma referência ao servidor real para fechar.
-                               // No entanto, em ambientes serverless como Vercel, o graceful shutdown do HTTP é gerido pela plataforma.
-                               // O foco aqui é fechar conexões externas como Redis.
-  
   redis.quit((err, res) => {
     if (err) {
         console.error("[REDIS_SHUTDOWN_ERROR] Erro ao fechar conexão Redis:", safeLogError(err));
@@ -439,7 +430,7 @@ function gracefulShutdown(signal) {
   setTimeout(() => {
     console.error("[SERVER_SHUTDOWN_TIMEOUT] Timeout ao fechar conexões. Forçando encerramento.");
     process.exit(1);
-  }, 10000); // Aumentado para 10s para dar mais tempo ao Redis
+  }, 10000);
 }
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
