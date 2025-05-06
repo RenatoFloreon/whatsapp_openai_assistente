@@ -307,21 +307,35 @@ async function sendWhatsappMessage(to, text) {
             "Content-Type": "application/json",
         };
 
-        try {
-            console.log(`[WHATSAPP_SEND] [${to}] Enviando bloco ${i + 1}/${messageChunks.length}: ${chunk.substring(0, 50)}...`);
-            await axios.post(url, data, { headers });
-            console.log(`[WHATSAPP_SEND] [${to}] Bloco ${i + 1} enviado com sucesso.`);
-        } catch (error) {
-            console.error(`[WHATSAPP_SEND] [${to}] Erro ao enviar bloco de mensagem ${i + 1}:`, 
-                error.response ? `Status ${error.response.status} - ${JSON.stringify(error.response.data)}` : error.message
-            );
-            if (error.response?.status === 429) {
-                 console.warn(`[WHATSAPP_SEND] [${to}] Limite de taxa da API do WhatsApp atingido. Considere adicionar atrasos ou tratar isso com mais robustez.`);
-            }
-            // Do not re-throw here to allow other chunks to be sent if possible, or to avoid breaking the main flow.
-            // The error is logged.
-        }
+        // Dentro da função sendWhatsappMessage, no loop for...
+// const data = { ... };
+// const headers = { ... };
+// const url = ...;
+
+const AXIOS_TIMEOUT = 15000; // Timeout de 15 segundos para a requisição
+
+try {
+    console.log(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Tentando enviar bloco ${i + 1}/${totalBlocks} para ${url} com timeout de ${AXIOS_TIMEOUT}ms`);
+    await axios.post(url, data, {
+        headers: headers,
+        timeout: AXIOS_TIMEOUT
+    });
+    console.log(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Bloco ${i + 1}/${totalBlocks} enviado com sucesso.`);
+} catch (error) {
+    console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Erro COMPLETO ao tentar enviar bloco ${i + 1}/${totalBlocks}:`, JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+    if (error.code === 'ECONNABORTED' || (error.message && error.message.toLowerCase().includes('timeout'))) {
+        console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] TIMEOUT (Código: ${error.code || 'N/A'}) ao enviar bloco ${i + 1}/${totalBlocks} após ${AXIOS_TIMEOUT}ms. Mensagem de erro: ${error.message}`);
+    } else if (error.response) {
+        console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Erro de RESPOSTA da API ao enviar bloco ${i + 1}/${totalBlocks}. Status: ${error.response.status}. Data:`, JSON.stringify(error.response.data, null, 2));
+    } else if (error.request) {
+        console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Erro de REQUISIÇÃO (sem resposta da API) ao enviar bloco ${i + 1}/${totalBlocks}:`, error.request);
+    } else {
+        console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Erro desconhecido ao enviar bloco ${i + 1}/${totalBlocks}: ${error.message}`);
     }
+    // Você pode decidir se quer parar de enviar os blocos restantes ou tentar continuar
+    // Por exemplo, para parar: return false; 
+}
+// ... (resto do loop)
 }
 
 async function handleOpenAIError(error, recipient) {
