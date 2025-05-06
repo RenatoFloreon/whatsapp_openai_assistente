@@ -92,6 +92,7 @@ app.get('/webhook', (req, res) => {
 // --- Handle Incoming Messages --- 
 app.post('/webhook', async (req, res) => {
         console.log('[WEBHOOK_ENTRY] POST request received on /webhook'); // <--- ADICIONE ESTA LINHA
+        console.log('[WEBHOOK_BODY] Full request body:', JSON.stringify(req.body, null, 2));
     
     const body = req.body;
 
