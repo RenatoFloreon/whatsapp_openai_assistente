@@ -1,4 +1,4 @@
-console.log('[INDEX_JS_TOP_LEVEL] Script execution started at ' + new Date().toISOString()); // <--- ADICIONE ESTA LINHA NO TOPO
+console.log("[INDEX_JS_TOP_LEVEL] Script execution started at " + new Date().toISOString());
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
@@ -29,7 +29,7 @@ const THREAD_EXPIRY_SECONDS = 12 * 60 * 60; // 12 hours
 const THREAD_EXPIRY_MILLISECONDS = THREAD_EXPIRY_SECONDS * 1000;
 const WHATSAPP_MAX_MESSAGE_LENGTH = parseInt(WHATSAPP_MAX_MESSAGE_LENGTH_ENV) || 4000;
 const POLLING_TIMEOUT_MS = 60000; // Max time to wait for Assistant run (60 seconds)
-const POLLING_INTERVAL_MS = 2000; // Interval between polling checks (2 seconds) - increased slightly
+const POLLING_INTERVAL_MS = 2000; // Interval between polling checks (2 seconds)
 
 const WELCOME_MESSAGE_1 = ENV_WELCOME_MESSAGE_1 || "Olá! Você está conversando com uma Inteligência Artificial experimental, e, portanto, podem acontecer erros.";
 const WELCOME_MESSAGE_2 = ENV_WELCOME_MESSAGE_2 || "Fique tranquilo(a) que seus dados estão protegidos, pois só consigo manter a memória da nossa conversa por 12 horas, depois o chat é reiniciado e os dados, apagados.";
@@ -59,8 +59,6 @@ if (!WHATSAPP_MAX_MESSAGE_LENGTH_ENV) {
 // --- Configure Redis Client ---
 const redis = new Redis(REDIS_URL, {
     maxRetriesPerRequest: 3,
-    // Enable TLS if required by your provider (like Vercel KV)
-    // tls: { rejectUnauthorized: false } 
 });
 
 redis.on("connect", () => console.log("[REDIS] Conectado com sucesso!"));
@@ -75,7 +73,7 @@ const openai = new OpenAI({
 
 // --- Webhook Verification --- 
 app.get('/webhook', (req, res) => {
-    console.log('[WEBHOOK_ENTRY] GET request received on /webhook'); // <--- ADICIONE ESTA LINHA
+    console.log('[WEBHOOK_ENTRY] GET request received on /webhook');
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
@@ -91,8 +89,8 @@ app.get('/webhook', (req, res) => {
 
 // --- Handle Incoming Messages --- 
 app.post('/webhook', async (req, res) => {
-        console.log('[WEBHOOK_ENTRY] POST request received on /webhook'); // <--- ADICIONE ESTA LINHA
-        console.log('[WEBHOOK_BODY] Full request body:', JSON.stringify(req.body, null, 2));
+    console.log('[WEBHOOK_ENTRY] POST request received on /webhook');
+    console.log('[WEBHOOK_BODY] Full request body:', JSON.stringify(req.body, null, 2));
     
     const body = req.body;
 
@@ -150,8 +148,6 @@ app.post('/webhook', async (req, res) => {
                     await sendWhatsappMessage(from, aiResponse);
                 } else {
                     console.warn(`[WEBHOOK] [${from}] handleOpenAICalls retornou uma resposta vazia ou indefinida. Nenhuma mensagem enviada para o usuário.`);
-                    // Consider sending a generic error if this state is unexpected
-                    // await sendWhatsappMessage(from, "Não consegui processar sua solicitação no momento.");
                 }
             } else {
                 console.warn(`[WEBHOOK] [${from}] Mensagem de texto recebida em um estado inesperado: ${userState}. Ignorando.`);
@@ -219,7 +215,6 @@ async function getOrCreateThread(from, userThreadDataKey) {
         console.log(`[REDIS] [${from}] Dados do tópico ${threadId} atualizados/salvos.`);
     } catch (error) {
         console.error(`[REDIS] [${from}] Erro ao salvar dados do tópico ${userThreadDataKey}:`, error);
-        // Non-critical for immediate flow, but log it.
     }
     return threadId;
 }
@@ -262,7 +257,7 @@ async function handleOpenAICalls(text, threadId, assistantId, from) {
                 console.log(`[OPENAI] [${from}] [Thread: ${threadId}] Conteúdo da mensagem da IA recebido: "${aiMessageContent.substring(0, 100)}"...`);
                 return aiMessageContent;
             } else {
-                console.error(`[OPENAI] [${from}] [Thread: ${threadId}] Nenhuma mensagem de texto da IA encontrada para a execução ${run.id}. Detalhes das mensagens recuperadas:`, JSON.stringify(allMessages.data.slice(0,5), null, 2)); // Log first 5 messages for brevity
+                console.error(`[OPENAI] [${from}] [Thread: ${threadId}] Nenhuma mensagem de texto da IA encontrada para a execução ${run.id}. Detalhes das mensagens recuperadas:`, JSON.stringify(allMessages.data.slice(0,5), null, 2));
                 return "Não consegui obter uma resposta formatada corretamente da IA desta vez.";
             }
         } else if (runStatus === "requires_action") {
@@ -307,66 +302,54 @@ async function sendWhatsappMessage(to, text) {
             "Content-Type": "application/json",
         };
 
-        // Dentro da função sendWhatsappMessage, no loop for...
-// const data = { ... };
-// const headers = { ... };
-// const url = ...;
+        const AXIOS_TIMEOUT = 15000; // Timeout de 15 segundos para a requisição
 
-const AXIOS_TIMEOUT = 15000; // Timeout de 15 segundos para a requisição
-
-try {
-    console.log(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Tentando enviar bloco ${i + 1}/${totalBlocks} para ${url} com timeout de ${AXIOS_TIMEOUT}ms`);
-    await axios.post(url, data, {
-        headers: headers,
-        timeout: AXIOS_TIMEOUT
-    });
-    console.log(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Bloco ${i + 1}/${totalBlocks} enviado com sucesso.`);
-} catch (error) {
-    console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Erro COMPLETO ao tentar enviar bloco ${i + 1}/${totalBlocks}:`, JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
-    if (error.code === 'ECONNABORTED' || (error.message && error.message.toLowerCase().includes('timeout'))) {
-        console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] TIMEOUT (Código: ${error.code || 'N/A'}) ao enviar bloco ${i + 1}/${totalBlocks} após ${AXIOS_TIMEOUT}ms. Mensagem de erro: ${error.message}`);
-    } else if (error.response) {
-        console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Erro de RESPOSTA da API ao enviar bloco ${i + 1}/${totalBlocks}. Status: ${error.response.status}. Data:`, JSON.stringify(error.response.data, null, 2));
-    } else if (error.request) {
-        console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Erro de REQUISIÇÃO (sem resposta da API) ao enviar bloco ${i + 1}/${totalBlocks}:`, error.request);
-    } else {
-        console.error(`[WHATSAPP_SEND] [${recipientPhoneNumber}] Erro desconhecido ao enviar bloco ${i + 1}/${totalBlocks}: ${error.message}`);
+        try {
+            console.log(`[WHATSAPP_SEND] [${to}] Tentando enviar bloco ${i + 1}/${messageChunks.length} para ${url} com timeout de ${AXIOS_TIMEOUT}ms`);
+            await axios.post(url, data, {
+                headers: headers,
+                timeout: AXIOS_TIMEOUT
+            });
+            console.log(`[WHATSAPP_SEND] [${to}] Bloco ${i + 1}/${messageChunks.length} enviado com sucesso.`);
+        } catch (error) {
+            console.error(`[WHATSAPP_SEND] [${to}] Erro COMPLETO ao tentar enviar bloco ${i + 1}/${messageChunks.length}:`, JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+            if (error.code === 'ECONNABORTED' || (error.message && error.message.toLowerCase().includes('timeout'))) {
+                console.error(`[WHATSAPP_SEND] [${to}] TIMEOUT (Código: ${error.code || 'N/A'}) ao enviar bloco ${i + 1}/${messageChunks.length} após ${AXIOS_TIMEOUT}ms. Mensagem de erro: ${error.message}`);
+            } else if (error.response) {
+                console.error(`[WHATSAPP_SEND] [${to}] Erro de RESPOSTA da API ao enviar bloco ${i + 1}/${messageChunks.length}. Status: ${error.response.status}. Data:`, JSON.stringify(error.response.data, null, 2));
+            } else if (error.request) {
+                console.error(`[WHATSAPP_SEND] [${to}] Erro de REQUISIÇÃO (sem resposta da API) ao enviar bloco ${i + 1}/${messageChunks.length}:`, error.request);
+            } else {
+                console.error(`[WHATSAPP_SEND] [${to}] Erro desconhecido ao enviar bloco ${i + 1}/${messageChunks.length}: ${error.message}`);
+            }
+        }
     }
-    // Você pode decidir se quer parar de enviar os blocos restantes ou tentar continuar
-    // Por exemplo, para parar: return false; 
-}
-// ... (resto do loop)
+    return true; // Indica que todas as tentativas de envio foram feitas
 }
 
 async function handleOpenAIError(error, recipient) {
     let userMessage = "Lamento, ocorreu um problema ao comunicar com a IA. Por favor, tente novamente mais tarde.";
     if (error.response) {
-        console.error(`[OPENAI_ERROR_HANDLER] [${recipient}] Erro da API OpenAI: Status ${error.response.status}`, error.response.data);
-        if (error.response.status === 429) {
-            userMessage = "Estou a receber muitos pedidos neste momento. Por favor, aguarde um pouco e tente novamente.";
+        console.error(`[OPENAI_ERROR_HANDLER] [${recipient}] Erro de API OpenAI: Status ${error.response.status}`, error.response.data);
+        if (error.response.status === 401) {
+            userMessage = "Erro de autenticação com a IA. Verifique as credenciais.";
+        } else if (error.response.status === 429) {
+            userMessage = "A IA está sobrecarregada no momento. Tente novamente em alguns instantes.";
         }
     } else {
-        console.error(`[OPENAI_ERROR_HANDLER] [${recipient}] Erro de SDK/Rede OpenAI:`, error.message);
+        console.error(`[OPENAI_ERROR_HANDLER] [${recipient}] Erro desconhecido na comunicação com a OpenAI:`, error.message);
     }
     await sendWhatsappMessage(recipient, userMessage);
 }
 
-async function handleGenericError(recipient, specificMessage = null) {
-    const userMessage = specificMessage || "Lamento, ocorreu um erro interno inesperado. Por favor, tente novamente mais tarde.";
-    console.log(`[GENERIC_ERROR_HANDLER] [${recipient}] Enviando mensagem de erro genérico: "${userMessage}"`);
-    await sendWhatsappMessage(recipient, userMessage);
+async function handleGenericError(recipient, customMessage = null) {
+    const message = customMessage || "Ocorreu um erro inesperado. Por favor, tente novamente.";
+    console.error(`[GENERIC_ERROR_HANDLER] [${recipient}] Enviando mensagem de erro genérico: ${message}`);
+    await sendWhatsappMessage(recipient, message);
 }
 
-// --- Start Server ---
 const serverPort = PORT || 3000;
 app.listen(serverPort, () => {
-    console.log(`Servidor rodando na porta ${serverPort}`);
-    console.log("Variáveis de ambiente carregadas:");
-    console.log(`- ASSISTANT_ID: ${ASSISTANT_ID ? 'Carregado' : 'AUSENTE!'}`);
-    console.log(`- REDIS_URL: ${REDIS_URL ? 'Carregado' : 'AUSENTE!'}`);
-    console.log(`- WHATSAPP_TOKEN: ${WHATSAPP_TOKEN ? 'Carregado' : 'AUSENTE!'}`);
-    console.log(`- WHATSAPP_PHONE_ID: ${WHATSAPP_PHONE_ID ? 'Carregado' : 'AUSENTE!'}`);
-    console.log(`- OPENAI_API_KEY: ${OPENAI_API_KEY ? 'Carregado' : 'AUSENTE!'}`);
-    console.log(`- VERIFY_TOKEN: ${VERIFY_TOKEN ? 'Carregado' : 'AUSENTE!'}`);
+    console.log(`[SERVER] Servidor rodando na porta ${serverPort}`);
 });
 
