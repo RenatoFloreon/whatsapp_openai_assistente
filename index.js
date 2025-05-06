@@ -73,7 +73,8 @@ const openai = new OpenAI({
 });
 
 // --- Webhook Verification --- 
-app.get("/webhook", (req, res) => {
+app.get('/webhook', (req, res) => {
+    console.log('[WEBHOOK_ENTRY] GET request received on /webhook'); // <--- ADICIONE ESTA LINHA
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
@@ -88,7 +89,9 @@ app.get("/webhook", (req, res) => {
 });
 
 // --- Handle Incoming Messages --- 
-app.post("/webhook", async (req, res) => {
+app.post('/webhook', async (req, res) => {
+        console.log('[WEBHOOK_ENTRY] POST request received on /webhook'); // <--- ADICIONE ESTA LINHA
+    
     const body = req.body;
 
     if (body.object !== "whatsapp_business_account") {
