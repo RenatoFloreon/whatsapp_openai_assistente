@@ -1,3 +1,4 @@
+console.log('[INDEX_JS_TOP_LEVEL] Script execution started at ' + new Date().toISOString()); // <--- ADICIONE ESTA LINHA NO TOPO
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
