@@ -17,7 +17,7 @@ const {
     OPENAI_PROJECT,
     REDIS_URL,
     ASSISTANT_ID,
-    WHATSAPP_MAX_MESSAGE_LENGTH: WHATSAPP_MAX_MESSAGE_LENGTH_ENV, // Renomeado para evitar conflito com constante antiga
+    WHATSAPP_MAX_MESSAGE_LENGTH: WHATSAPP_MAX_MESSAGE_LENGTH_ENV,
     WELCOME_MESSAGE_1: ENV_WELCOME_MESSAGE_1,
     WELCOME_MESSAGE_2: ENV_WELCOME_MESSAGE_2,
     PROCESSING_MESSAGE: ENV_PROCESSING_MESSAGE
@@ -28,7 +28,7 @@ const THREAD_EXPIRY_SECONDS = 12 * 60 * 60; // 12 hours
 const THREAD_EXPIRY_MILLISECONDS = THREAD_EXPIRY_SECONDS * 1000;
 const WHATSAPP_MAX_MESSAGE_LENGTH = parseInt(WHATSAPP_MAX_MESSAGE_LENGTH_ENV) || 4000;
 const POLLING_TIMEOUT_MS = 60000; // Max time to wait for Assistant run (60 seconds)
-const POLLING_INTERVAL_MS = 1500; // Interval between polling checks (1.5 seconds)
+const POLLING_INTERVAL_MS = 2000; // Interval between polling checks (2 seconds) - increased slightly
 
 const WELCOME_MESSAGE_1 = ENV_WELCOME_MESSAGE_1 || "Olá! Sou seu assistente virtual. Estou aqui para ajudar com suas dúvidas e solicitações.";
 const WELCOME_MESSAGE_2 = ENV_WELCOME_MESSAGE_2 || "Para começar, por favor, descreva sua dúvida ou o que você precisa.";
@@ -55,7 +55,6 @@ if (!WHATSAPP_MAX_MESSAGE_LENGTH_ENV) {
     console.warn("WARN: Missing WHATSAPP_MAX_MESSAGE_LENGTH environment variable. Using default 4000.");
 }
 
-
 // --- Configure Redis Client ---
 const redis = new Redis(REDIS_URL, {
     maxRetriesPerRequest: 3,
@@ -63,8 +62,8 @@ const redis = new Redis(REDIS_URL, {
     // tls: { rejectUnauthorized: false } 
 });
 
-redis.on("connect", () => console.log("Redis connected successfully!"));
-redis.on("error", (err) => console.error("Redis connection error:", err));
+redis.on("connect", () => console.log("[REDIS] Conectado com sucesso!"));
+redis.on("error", (err) => console.error("[REDIS] Erro de conexão:", err));
 
 // --- Configure OpenAI Client ---
 const openai = new OpenAI({
@@ -80,10 +79,10 @@ app.get("/webhook", (req, res) => {
     const challenge = req.query["hub.challenge"];
 
     if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
-        console.log("Webhook verified successfully!");
+        console.log("[WEBHOOK_VERIFICATION] Webhook verificado com sucesso!");
         res.status(200).send(challenge);
     } else {
-        console.warn("Webhook verification failed.", { mode, token });
+        console.warn("[WEBHOOK_VERIFICATION] Falha na verificação do webhook.", { mode, token });
         res.sendStatus(403);
     }
 });
@@ -93,15 +92,15 @@ app.post("/webhook", async (req, res) => {
     const body = req.body;
 
     if (body.object !== "whatsapp_business_account") {
-        res.sendStatus(404); // Not a WhatsApp event we process
+        res.sendStatus(404); 
         return;
     }
 
     const messageEntry = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
     if (!messageEntry) {
-        console.log("Received WhatsApp notification without a message entry, ignoring.");
-        res.sendStatus(200); // Acknowledge, but nothing to process
+        console.log("[WEBHOOK] Recebeu notificação do WhatsApp sem uma entrada de mensagem, ignorando.");
+        res.sendStatus(200); 
         return;
     }
 
@@ -110,68 +109,60 @@ app.post("/webhook", async (req, res) => {
     const userStateKey = `whatsapp_user_status:${from}`;
     const userThreadDataKey = `whatsapp_thread_data:${from}`;
 
-    console.log(`[${from}] Received incoming notification. Type: ${messageType}`);
+    console.log(`[WEBHOOK] [${from}] Notificação recebida. Tipo: ${messageType}`);
     res.sendStatus(200); // Acknowledge receipt immediately to WhatsApp
 
     try {
         let userState = await redis.get(userStateKey);
+        console.log(`[REDIS] [${from}] Estado atual do usuário: ${userState}`);
 
-        // Handle 'request_welcome' or first text message from a new/reset user
         if (messageType === "request_welcome" || (messageType === "text" && !userState)) {
-            console.log(`[${from}] Initiating welcome flow. Current state: ${userState}, Message Type: ${messageType}`);
+            console.log(`[WEBHOOK] [${from}] Iniciando fluxo de boas-vindas. Estado anterior: ${userState}, Tipo de Mensagem: ${messageType}`);
             await sendWhatsappMessage(from, WELCOME_MESSAGE_1);
             await sendWhatsappMessage(from, WELCOME_MESSAGE_2);
             await redis.set(userStateKey, USER_STATE_AWAITING_INITIAL_PROMPT, "EX", THREAD_EXPIRY_SECONDS * 2);
-            return; // End processing for this request, wait for user's actual prompt
+            console.log(`[REDIS] [${from}] Estado do usuário definido para AWAITING_INITIAL_PROMPT.`);
+            return; 
         }
 
         if (messageType === "text") {
             const msg_body = messageEntry.text.body;
-            console.log(`[${from}] Received text message: "${msg_body.substring(0,50)}..." Current state: ${userState}`);
+            console.log(`[WEBHOOK] [${from}] Mensagem de texto recebida: "${msg_body.substring(0,50)}..." Estado atual: ${userState}`);
 
-            if (userState === USER_STATE_AWAITING_INITIAL_PROMPT || userState === USER_STATE_CONVERSING || !userState) {
-                // If !userState here, it implies request_welcome wasn't hit, but it's a text from a potentially known user or a user who missed welcome.
-                // We can transition them to conversing. If it's truly their first prompt, the thread creation will handle it.
+            if (userState === USER_STATE_AWAITING_INITIAL_PROMPT || userState === USER_STATE_CONVERSING) {
                 if (userState === USER_STATE_AWAITING_INITIAL_PROMPT) {
-                     console.log(`[${from}] Received initial prompt after welcome.`);
+                     console.log(`[WEBHOOK] [${from}] Recebeu o prompt inicial após as boas-vindas.`);
                 }
                 await sendWhatsappMessage(from, PROCESSING_MESSAGE);
                 await redis.set(userStateKey, USER_STATE_CONVERSING, "EX", THREAD_EXPIRY_SECONDS * 2);
+                console.log(`[REDIS] [${from}] Estado do usuário definido para CONVERSING.`);
 
-                // Proceed with OpenAI Assistant logic
-                let threadId = await getOrCreateThread(from, userThreadDataKey, userStateKey); // Pass userStateKey to potentially reset if thread is new
-                if (!threadId) return; // Error handled within getOrCreateThread
+                let threadId = await getOrCreateThread(from, userThreadDataKey);
+                if (!threadId) return; 
 
-                await openai.beta.threads.messages.create(threadId, {
-                    role: "user",
-                    content: msg_body,
-                });
-                console.log(`[${from}] Added message to thread ${threadId}`);
-
-                const run = await openai.beta.threads.runs.create(threadId, {
-                    assistant_id: ASSISTANT_ID,
-                });
-                console.log(`[${from}] Created run ${run.id} for thread ${threadId}`);
-
-                const finalRunStatus = await pollRunStatus(threadId, run.id, from);
-                await processRunResult(finalRunStatus, threadId, run.id, from);
+                const aiResponse = await handleOpenAICalls(msg_body, threadId, ASSISTANT_ID, from);
+                if (aiResponse) {
+                    await sendWhatsappMessage(from, aiResponse);
+                } else {
+                    console.warn(`[WEBHOOK] [${from}] handleOpenAICalls retornou uma resposta vazia ou indefinida. Nenhuma mensagem enviada para o usuário.`);
+                    // Consider sending a generic error if this state is unexpected
+                    // await sendWhatsappMessage(from, "Não consegui processar sua solicitação no momento.");
+                }
             } else {
-                console.warn(`[${from}] Received text message in an unexpected state: ${userState}. Ignoring.`);
-                // Optionally, send a message like "I'm not sure how to handle that right now."
+                console.warn(`[WEBHOOK] [${from}] Mensagem de texto recebida em um estado inesperado: ${userState}. Ignorando.`);
             }
         } else {
-            console.log(`[${from}] Received non-text message type: ${messageType}, ignoring for main processing.`);
-            // If other message types (image, audio) need handling, add logic here.
+            console.log(`[WEBHOOK] [${from}] Tipo de mensagem não textual recebido: ${messageType}, ignorando para processamento principal.`);
         }
     } catch (error) {
-        console.error(`[${from}] Unhandled error in main webhook processing:`, error);
+        console.error(`[WEBHOOK] [${from}] Erro não tratado no processamento principal do webhook:`, error.message, error.stack);
         await handleGenericError(from);
     }
 });
 
 // --- Helper Functions ---
 
-async function getOrCreateThread(from, userThreadDataKey, userStateKey) {
+async function getOrCreateThread(from, userThreadDataKey) {
     let threadId = null;
     let createNewThread = false;
     const now = Date.now();
@@ -182,23 +173,23 @@ async function getOrCreateThread(from, userThreadDataKey, userStateKey) {
             const threadData = JSON.parse(threadDataString);
             if (threadData.threadId && threadData.lastInteractionTimestamp) {
                 if (now - threadData.lastInteractionTimestamp > THREAD_EXPIRY_MILLISECONDS) {
-                    console.log(`[${from}] Thread expired. Creating new thread.`);
+                    console.log(`[REDIS] [${from}] Tópico expirado. Criando novo tópico.`);
                     createNewThread = true;
                 } else {
                     threadId = threadData.threadId;
-                    console.log(`[${from}] Using existing thread ${threadId}.`);
+                    console.log(`[REDIS] [${from}] Usando tópico existente ${threadId}.`);
                 }
             } else {
-                console.warn(`[${from}] Invalid thread data found. Creating new thread.`);
+                console.warn(`[REDIS] [${from}] Dados de tópico inválidos encontrados. Criando novo tópico.`);
                 createNewThread = true;
             }
         } else {
-            console.log(`[${from}] No thread data found. Creating new thread.`);
+            console.log(`[REDIS] [${from}] Nenhum dado de tópico encontrado. Criando novo tópico.`);
             createNewThread = true;
         }
     } catch (error) {
-        console.error(`[${from}] Redis GET error for ${userThreadDataKey}:`, error);
-        await handleGenericError(from, "Error accessing conversation state.");
+        console.error(`[REDIS] [${from}] Erro ao obter dados do tópico ${userThreadDataKey}:`, error);
+        await handleGenericError(from, "Erro ao acessar o estado da conversa.");
         return null;
     }
 
@@ -206,15 +197,9 @@ async function getOrCreateThread(from, userThreadDataKey, userStateKey) {
         try {
             const thread = await openai.beta.threads.create();
             threadId = thread.id;
-            console.log(`[${from}] Created new thread ${threadId}`);
-            // If a new thread is created, it implies a new conversation session.
-            // Reset user state to ensure welcome messages are sent if they interact again after a long break (handled by main webhook logic).
-            // However, if getOrCreateThread is called *after* welcome, this might be redundant or slightly off.
-            // For now, the welcome logic is primarily at the start of the webhook.
-            // Consider if userStateKey needs reset here. If thread expired, user state might also be stale.
-            // The main webhook logic should re-trigger welcome if userState is not AWAITING_INITIAL_PROMPT or CONVERSING.
+            console.log(`[OPENAI] [${from}] Novo tópico criado: ${threadId}`);
         } catch (error) {
-            console.error(`[${from}] OpenAI thread creation error:`, error);
+            console.error(`[OPENAI] [${from}] Erro na criação do tópico OpenAI:`, error);
             await handleOpenAIError(error, from);
             return null;
         }
@@ -226,75 +211,74 @@ async function getOrCreateThread(from, userThreadDataKey, userStateKey) {
             lastInteractionTimestamp: now 
         });
         await redis.set(userThreadDataKey, newThreadData, "EX", THREAD_EXPIRY_SECONDS * 2); 
+        console.log(`[REDIS] [${from}] Dados do tópico ${threadId} atualizados/salvos.`);
     } catch (error) {
-        console.error(`[${from}] Redis SET error for ${userThreadDataKey}:`, error);
+        console.error(`[REDIS] [${from}] Erro ao salvar dados do tópico ${userThreadDataKey}:`, error);
+        // Non-critical for immediate flow, but log it.
     }
-
     return threadId;
 }
 
-async function pollRunStatus(threadId, runId, from) {
-    const startTime = Date.now();
+async function handleOpenAICalls(text, threadId, assistantId, from) {
+    console.log(`[OPENAI] [${from}] Iniciando handleOpenAICalls. Thread: ${threadId}, Assistant: ${assistantId}, Mensagem: "${text.substring(0, 100)}"...`);
     try {
-        while (Date.now() - startTime < POLLING_TIMEOUT_MS) {
-            const currentRun = await openai.beta.threads.runs.retrieve(threadId, runId);
-            const status = currentRun.status;
-            console.log(`[${from}] Run ${runId} status: ${status}`);
+        console.log(`[OPENAI] [${from}] [Thread: ${threadId}] Adicionando mensagem do usuário ao tópico...`);
+        await openai.beta.threads.messages.create(threadId, { role: "user", content: text });
+        console.log(`[OPENAI] [${from}] [Thread: ${threadId}] Mensagem do usuário adicionada com sucesso.`);
 
-            if (!["queued", "in_progress", "cancelling"].includes(status)) {
-                return status;
+        console.log(`[OPENAI] [${from}] [Thread: ${threadId}] Criando execução (run) com o assistente ${assistantId}...`);
+        const run = await openai.beta.threads.runs.create(threadId, { assistant_id: assistantId });
+        console.log(`[OPENAI] [${from}] [Thread: ${threadId}] Execução (run) criada com ID: ${run.id}. Status inicial: ${run.status}`);
+
+        let runStatus = run.status;
+        const startTime = Date.now();
+
+        while (runStatus === "queued" || runStatus === "in_progress" || runStatus === "requires_action") {
+            if (Date.now() - startTime > POLLING_TIMEOUT_MS) {
+                console.error(`[OPENAI] [${from}] [Thread: ${threadId}] Timeout ao aguardar conclusão da execução ${run.id}. Último status: ${runStatus}`);
+                return "Desculpe, a solicitação demorou muito para ser processada.";
             }
             await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL_MS));
+            const currentRun = await openai.beta.threads.runs.retrieve(threadId, run.id);
+            runStatus = currentRun.status;
+            console.log(`[OPENAI] [${from}] [Thread: ${threadId}] Status da execução ${run.id}: ${runStatus}`);
         }
-        console.warn(`[${from}] Run ${runId} polling timed out after ${POLLING_TIMEOUT_MS}ms.`);
-        await sendWhatsappMessage(from, "A IA está demorando muito para responder. Por favor, tente novamente em alguns instantes.");
-        return "timed_out";
-    } catch (error) {
-        console.error(`[${from}] Error polling run ${runId} status:`, error);
-        await handleOpenAIError(error, from);
-        return "polling_error";
-    }
-}
 
-async function processRunResult(finalRunStatus, threadId, runId, from) {
-    try {
-        if (finalRunStatus === "completed") {
-            console.log(`[${from}] Run ${runId} completed. Fetching messages.`);
-            const messages = await openai.beta.threads.messages.list(threadId, { order: 'desc', limit: 10 });
-            const assistantMessages = messages.data.filter(m => m.run_id === runId && m.role === 'assistant');
+        if (runStatus === "completed") {
+            console.log(`[OPENAI] [${from}] [Thread: ${threadId}] Execução ${run.id} completada. Buscando mensagens...`);
+            const allMessages = await openai.beta.threads.messages.list(threadId, { order: "desc", limit: 20 });
             
-            if (assistantMessages.length > 0) {
-                for (const assistantMessage of assistantMessages.reverse()) {
-                    if (assistantMessage.content[0]?.type === 'text') {
-                        const responseText = assistantMessage.content[0].text.value;
-                        if (responseText) {
-                            console.log(`[${from}] Assistant response: ${responseText.substring(0, 100)}...`);
-                            await sendWhatsappMessage(from, responseText);
-                        } else {
-                             console.warn(`[${from}] Assistant message content is empty for run ${runId}.`);
-                        }
-                    }
-                }
+            const assistantMessageFromRun = allMessages.data.find(
+                (msg) => msg.role === "assistant" && msg.run_id === run.id && msg.content[0]?.type === "text"
+            );
+
+            if (assistantMessageFromRun) {
+                const aiMessageContent = assistantMessageFromRun.content[0].text.value;
+                console.log(`[OPENAI] [${from}] [Thread: ${threadId}] Conteúdo da mensagem da IA recebido: "${aiMessageContent.substring(0, 100)}"...`);
+                return aiMessageContent;
             } else {
-                console.warn(`[${from}] No new assistant messages found for completed run ${runId}.`);
-                await sendWhatsappMessage(from, "Não consegui gerar uma resposta para sua solicitação no momento. Tente reformular sua pergunta.");
+                console.error(`[OPENAI] [${from}] [Thread: ${threadId}] Nenhuma mensagem de texto da IA encontrada para a execução ${run.id}. Detalhes das mensagens recuperadas:`, JSON.stringify(allMessages.data.slice(0,5), null, 2)); // Log first 5 messages for brevity
+                return "Não consegui obter uma resposta formatada corretamente da IA desta vez.";
             }
-        } else if (finalRunStatus === "requires_action") {
-            console.error(`[${from}] Run ${runId} requires action (Function Calling not implemented).`);
-            await sendWhatsappMessage(from, "Preciso de realizar uma ação que ainda não sei fazer. Por favor, contacte o suporte.");
-        } else if (finalRunStatus !== "timed_out" && finalRunStatus !== "polling_error") { // Avoid double messaging for timeout/polling handled in pollRunStatus
-            console.error(`[${from}] Run ${runId} ended with status: ${finalRunStatus}`);
-            await sendWhatsappMessage(from, "Lamento, ocorreu um problema ao processar o seu pedido com a IA. Tente novamente.");
+        } else if (runStatus === "requires_action") {
+             console.error(`[OPENAI] [${from}] [Thread: ${threadId}] Execução ${run.id} requer ação (Function Calling não implementado).`);
+             return "Preciso de realizar uma ação que ainda não sei fazer. Por favor, contacte o suporte.";
+        } else {
+            console.error(`[OPENAI] [${from}] [Thread: ${threadId}] Execução ${run.id} finalizada com status inesperado: ${runStatus}`);
+            return `Desculpe, houve um problema com a IA (status: ${runStatus}).`;
         }
     } catch (error) {
-        console.error(`[${from}] Error processing run ${runId} result:`, error);
-        await handleOpenAIError(error, from);
+        console.error(`[OPENAI] [${from}] [Thread: ${threadId}] Erro durante chamada à API OpenAI:`, error.message, error.stack);
+        if (error.response && error.response.data) {
+            console.error(`[OPENAI] [${from}] Detalhes do erro da API OpenAI:`, JSON.stringify(error.response.data, null, 2));
+        }
+        return "Desculpe, ocorreu um erro ao conectar com a IA. Tente novamente.";
     }
 }
 
 async function sendWhatsappMessage(to, text) {
     if (!text || String(text).trim() === "") {
-        console.warn(`[${to}] Attempted to send empty message. Aborting.`);
+        console.warn(`[WHATSAPP_SEND] [${to}] Tentativa de enviar mensagem vazia. Abortando.`);
         return;
     }
     const messageChunks = [];
@@ -302,7 +286,7 @@ async function sendWhatsappMessage(to, text) {
         messageChunks.push(text.substring(i, i + WHATSAPP_MAX_MESSAGE_LENGTH));
     }
 
-    console.log(`[${to}] Sending ${messageChunks.length} message chunk(s).`);
+    console.log(`[WHATSAPP_SEND] [${to}] Enviando ${messageChunks.length} bloco(s) de mensagem.`);
 
     for (let i = 0; i < messageChunks.length; i++) {
         const chunk = messageChunks[i];
@@ -319,16 +303,18 @@ async function sendWhatsappMessage(to, text) {
         };
 
         try {
-            console.log(`[${to}] Sending chunk ${i + 1}/${messageChunks.length}: ${chunk.substring(0, 50)}...`);
+            console.log(`[WHATSAPP_SEND] [${to}] Enviando bloco ${i + 1}/${messageChunks.length}: ${chunk.substring(0, 50)}...`);
             await axios.post(url, data, { headers });
-            console.log(`[${to}] Chunk ${i + 1} sent successfully.`);
+            console.log(`[WHATSAPP_SEND] [${to}] Bloco ${i + 1} enviado com sucesso.`);
         } catch (error) {
-            console.error(`[${to}] Error sending WhatsApp message chunk ${i + 1}:`, 
+            console.error(`[WHATSAPP_SEND] [${to}] Erro ao enviar bloco de mensagem ${i + 1}:`, 
                 error.response ? `Status ${error.response.status} - ${JSON.stringify(error.response.data)}` : error.message
             );
             if (error.response?.status === 429) {
-                 console.warn(`[${to}] WhatsApp API rate limit hit. Consider adding delays or handling this more gracefully.`);
+                 console.warn(`[WHATSAPP_SEND] [${to}] Limite de taxa da API do WhatsApp atingido. Considere adicionar atrasos ou tratar isso com mais robustez.`);
             }
+            // Do not re-throw here to allow other chunks to be sent if possible, or to avoid breaking the main flow.
+            // The error is logged.
         }
     }
 }
@@ -336,27 +322,32 @@ async function sendWhatsappMessage(to, text) {
 async function handleOpenAIError(error, recipient) {
     let userMessage = "Lamento, ocorreu um problema ao comunicar com a IA. Por favor, tente novamente mais tarde.";
     if (error.response) {
-        console.error(`[${recipient}] OpenAI API Error: Status ${error.response.status}`, error.response.data);
+        console.error(`[OPENAI_ERROR_HANDLER] [${recipient}] Erro da API OpenAI: Status ${error.response.status}`, error.response.data);
         if (error.response.status === 429) {
             userMessage = "Estou a receber muitos pedidos neste momento. Por favor, aguarde um pouco e tente novamente.";
         }
     } else {
-        console.error(`[${recipient}] OpenAI SDK/Network Error:`, error.message);
+        console.error(`[OPENAI_ERROR_HANDLER] [${recipient}] Erro de SDK/Rede OpenAI:`, error.message);
     }
     await sendWhatsappMessage(recipient, userMessage);
 }
 
 async function handleGenericError(recipient, specificMessage = null) {
     const userMessage = specificMessage || "Lamento, ocorreu um erro interno inesperado. Por favor, tente novamente mais tarde.";
+    console.log(`[GENERIC_ERROR_HANDLER] [${recipient}] Enviando mensagem de erro genérico: "${userMessage}"`);
     await sendWhatsappMessage(recipient, userMessage);
 }
 
-if (process.env.NODE_ENV !== "production") {
-    const port = PORT || 3000;
-    app.listen(port, () => {
-        console.log(`Webhook listener started locally on port ${port}`);
-    });
-}
-
-module.exports = app;
+// --- Start Server ---
+const serverPort = PORT || 3000;
+app.listen(serverPort, () => {
+    console.log(`Servidor rodando na porta ${serverPort}`);
+    console.log("Variáveis de ambiente carregadas:");
+    console.log(`- ASSISTANT_ID: ${ASSISTANT_ID ? 'Carregado' : 'AUSENTE!'}`);
+    console.log(`- REDIS_URL: ${REDIS_URL ? 'Carregado' : 'AUSENTE!'}`);
+    console.log(`- WHATSAPP_TOKEN: ${WHATSAPP_TOKEN ? 'Carregado' : 'AUSENTE!'}`);
+    console.log(`- WHATSAPP_PHONE_ID: ${WHATSAPP_PHONE_ID ? 'Carregado' : 'AUSENTE!'}`);
+    console.log(`- OPENAI_API_KEY: ${OPENAI_API_KEY ? 'Carregado' : 'AUSENTE!'}`);
+    console.log(`- VERIFY_TOKEN: ${VERIFY_TOKEN ? 'Carregado' : 'AUSENTE!'}`);
+});
 
