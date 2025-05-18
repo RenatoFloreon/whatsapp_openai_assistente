@@ -18,9 +18,6 @@ module.exports = (req, res) => {
   if (req.method === 'POST') {
     const body = req.body;
     console.log('[WEBHOOK] Evento recebido:', JSON.stringify(body, null, 2));
-
-    // TODO: encaminhar para processamento da IA
-
     res.status(200).send('EVENT_RECEIVED');
   }
 };
