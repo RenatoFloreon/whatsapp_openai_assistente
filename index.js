@@ -8,7 +8,9 @@ const cheerio = require("cheerio");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const puppeteer = require("puppeteer");
+const puppeteer = require('puppeteer');
+const chromium = require('@sparticuz/chromium');
+
 
 const app = express();
 app.use(express.json());
@@ -182,7 +184,14 @@ async function scrapeInstagramProfile(username) {
         };
         // 1. Acessar página do Instagram com Puppeteer
         if (!browser) {
-            browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+           browser = await puppeteer.launch({
+  args: chromium.args,
+  defaultViewport: chromium.defaultViewport,
+  executablePath: await chromium.executablePath(),
+  headless: chromium.headless,
+  ignoreHTTPSErrors: true
+});
+
             console.log("[PUPPETEER] Navegador Puppeteer iniciado.");
         }
         const page = await browser.newPage();
