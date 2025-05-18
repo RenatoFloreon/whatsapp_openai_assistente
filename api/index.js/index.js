@@ -15,6 +15,7 @@ const chromium = require('@sparticuz/chromium');
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use("/api/webhook", require("./webhook"));
 
 // Configurações básicas
 const PORT = process.env.PORT || 3000;
