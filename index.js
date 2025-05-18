@@ -153,13 +153,33 @@ async function sendWhatsappMessage(phoneNumber, messageBlocks, attempt = 1, maxA
     }
 }
 
-// Função para extrair dados públicos do Instagram
+// Função para extrair dados públicos do Instagram e enriquecer com outras fontes
 async function scrapeInstagramProfile(username) {
     console.log(`[INSTAGRAM_SCRAPE_ATTEMPT] Tentando extrair dados do perfil: ${username}`);
     try {
         // Removendo @ se existir
         username = username.replace('@', '');
         
+        // Objeto para armazenar todos os dados coletados
+        const profileData = {
+            username: username,
+            fullName: '',
+            bio: '',
+            followersCount: 0,
+            postsCount: 0,
+            isBusinessAccount: false,
+            businessCategory: '',
+            recentPosts: [],
+            hashtags: [],
+            profileImageAnalysis: {},
+            websiteUrl: '',
+            linkedProfiles: {},
+            contentThemes: [],
+            locationInfo: '',
+            additionalInfo: {}
+        };
+
+        // 1. Extrair dados do Instagram
         const response = await axios.get(`https://www.instagram.com/${username}/`, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -169,23 +189,11 @@ async function scrapeInstagramProfile(username) {
                 'Upgrade-Insecure-Requests': '1',
                 'Cache-Control': 'max-age=0'
             },
-            timeout: 10000
+            timeout: 15000
         });
 
         const $ = cheerio.load(response.data);
         
-        // Extrair dados básicos do perfil
-        const profileData = {
-            username: username,
-            fullName: '',
-            bio: '',
-            followersCount: 0,
-            postsCount: 0,
-            isBusinessAccount: false,
-            businessCategory: '',
-            recentPosts: []
-        };
-
         // Extrair metadados do perfil
         const metaTags = $('meta');
         metaTags.each((i, el) => {
@@ -198,18 +206,22 @@ async function scrapeInstagramProfile(username) {
                 if (content.includes('Followers') && content.includes('Following')) {
                     profileData.bio = content.split('Followers')[0].trim();
                     
-                    // Tentar extrair contagem de seguidores
+                    // Extrair contagem de seguidores
                     const followersMatch = content.match(/(\d+(?:,\d+)*) Followers/);
                     if (followersMatch) {
                         profileData.followersCount = parseInt(followersMatch[1].replace(/,/g, ''));
                     }
                     
-                    // Tentar extrair contagem de posts
+                    // Extrair contagem de posts
                     const postsMatch = content.match(/(\d+(?:,\d+)*) Posts/);
                     if (postsMatch) {
                         profileData.postsCount = parseInt(postsMatch[1].replace(/,/g, ''));
                     }
                 }
+            }
+            // Extrair URL da imagem de perfil
+            if (property === 'og:image') {
+                profileData.profileImageUrl = $(el).attr('content');
             }
         });
 
@@ -218,7 +230,7 @@ async function scrapeInstagramProfile(username) {
             profileData.isBusinessAccount = true;
         }
 
-        // Tentar extrair categoria de negócio
+        // Extrair categoria de negócio
         const categoryElement = $('div:contains("·")').first();
         if (categoryElement.length > 0) {
             const categoryText = categoryElement.text();
@@ -227,10 +239,165 @@ async function scrapeInstagramProfile(username) {
             }
         }
 
-        console.log(`[INSTAGRAM_SCRAPE_SUCCESS] Dados extraídos com sucesso para: ${username}`);
+        // Extrair website/link na bio
+        const linkElements = $('a[href^="http"]');
+        linkElements.each((i, el) => {
+            const href = $(el).attr('href');
+            if (href && !href.includes('instagram.com')) {
+                profileData.websiteUrl = href;
+                return false; // break the loop after finding the first external link
+            }
+        });
+
+        // Extrair hashtags da bio
+        const bioText = profileData.bio;
+        const hashtagRegex = /#(\w+)/g;
+        let match;
+        while ((match = hashtagRegex.exec(bioText)) !== null) {
+            profileData.hashtags.push(match[1]);
+        }
+
+        // Tentar extrair localização
+        const locationElement = $('span:contains("📍")');
+        if (locationElement.length > 0) {
+            profileData.locationInfo = locationElement.text().replace('📍', '').trim();
+        }
+
+        // 2. Buscar informações adicionais no Google
+        try {
+            const googleResponse = await axios.get(`https://www.google.com/search?q=${encodeURIComponent(profileData.fullName || username)}`, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                }
+            });
+            
+            const $google = cheerio.load(googleResponse.data);
+            
+            // Extrair snippets de informação do Google
+            const snippets = [];
+            $google('.VwiC3b').each((i, el) => {
+                const snippet = $google(el).text().trim();
+                if (snippet && snippet.length > 20) {
+                    snippets.push(snippet);
+                }
+            });
+            
+            if (snippets.length > 0) {
+                profileData.additionalInfo.googleSnippets = snippets.slice(0, 3);
+            }
+            
+            // Tentar encontrar perfil do LinkedIn
+            const linkedinLink = $google('a[href*="linkedin.com/in/"]').first().attr('href');
+            if (linkedinLink) {
+                profileData.linkedProfiles.linkedin = linkedinLink;
+            }
+            
+        } catch (error) {
+            console.log(`[GOOGLE_SEARCH_INFO] Não foi possível obter informações adicionais do Google: ${error.message}`);
+        }
+
+        // 3. Analisar a imagem de perfil usando a OpenAI (se disponível)
+        if (profileData.profileImageUrl && openai) {
+            try {
+                const imageAnalysisPrompt = `
+                Analise esta imagem de perfil do Instagram e descreva:
+                1. O que a pessoa está fazendo na foto
+                2. Ambiente/cenário (interior, exterior, natureza, urbano, etc.)
+                3. Estilo visual e cores predominantes
+                4. Impressão geral transmitida (profissional, casual, artística, etc.)
+                5. Elementos notáveis (objetos, símbolos, texto)
+                
+                Forneça uma análise concisa em português.
+                `;
+                
+                const imageAnalysis = await openai.chat.completions.create({
+                    model: "gpt-4-vision-preview",
+                    messages: [
+                        {
+                            role: "user",
+                            content: [
+                                { type: "text", text: imageAnalysisPrompt },
+                                { type: "image_url", image_url: { url: profileData.profileImageUrl } }
+                            ]
+                        }
+                    ],
+                    max_tokens: 300
+                });
+                
+                profileData.profileImageAnalysis = {
+                    description: imageAnalysis.choices[0].message.content
+                };
+                
+                console.log(`[PROFILE_IMAGE_ANALYSIS_SUCCESS] Análise da imagem de perfil concluída para: ${username}`);
+            } catch (error) {
+                console.log(`[PROFILE_IMAGE_ANALYSIS_INFO] Não foi possível analisar a imagem de perfil: ${error.message}`);
+            }
+        }
+
+        // 4. Identificar temas de conteúdo com base nos dados coletados
+        try {
+            if (openai && (profileData.bio || profileData.hashtags.length > 0)) {
+                const contentAnalysisPrompt = `
+                Com base nas seguintes informações de um perfil do Instagram, identifique os principais temas de conteúdo e interesses:
+                
+                Nome: ${profileData.fullName}
+                Bio: ${profileData.bio}
+                Hashtags: ${profileData.hashtags.join(', ')}
+                Categoria: ${profileData.businessCategory}
+                
+                Liste apenas 3-5 temas principais em português, separados por vírgula.
+                `;
+                
+                const contentAnalysis = await openai.chat.completions.create({
+                    model: "gpt-4",
+                    messages: [
+                        { role: "user", content: contentAnalysisPrompt }
+                    ],
+                    max_tokens: 100
+                });
+                
+                const themes = contentAnalysis.choices[0].message.content.split(',').map(theme => theme.trim());
+                profileData.contentThemes = themes;
+                
+                console.log(`[CONTENT_THEMES_ANALYSIS_SUCCESS] Temas de conteúdo identificados para: ${username}`);
+            }
+        } catch (error) {
+            console.log(`[CONTENT_THEMES_ANALYSIS_INFO] Não foi possível identificar temas de conteúdo: ${error.message}`);
+        }
+
+        console.log(`[INSTAGRAM_SCRAPE_SUCCESS] Dados enriquecidos extraídos com sucesso para: ${username}`);
         return profileData;
     } catch (error) {
         console.error(`[INSTAGRAM_SCRAPE_ERROR] Erro ao extrair dados do perfil ${username}:`, safeLogError(error));
+        
+        // Mesmo com erro, tentar obter informações básicas via OpenAI
+        try {
+            if (openai) {
+                const fallbackAnalysisPrompt = `
+                Gere informações hipotéticas plausíveis para um perfil de Instagram com o nome de usuário @${username}.
+                Inclua: possível nome completo, bio provável, tipo de conteúdo que provavelmente compartilha,
+                e se parece ser uma conta pessoal ou profissional. Base sua análise apenas no nome de usuário.
+                Responda em português.
+                `;
+                
+                const fallbackAnalysis = await openai.chat.completions.create({
+                    model: "gpt-4",
+                    messages: [
+                        { role: "user", content: fallbackAnalysisPrompt }
+                    ],
+                    max_tokens: 250
+                });
+                
+                return {
+                    username: username,
+                    fallbackAnalysis: fallbackAnalysis.choices[0].message.content,
+                    error: "Não foi possível extrair dados reais do perfil"
+                };
+            }
+        } catch (fallbackError) {
+            console.error(`[FALLBACK_ANALYSIS_ERROR] Erro ao gerar análise alternativa: ${fallbackError.message}`);
+        }
+        
         return {
             username: username,
             error: "Não foi possível extrair dados do perfil"
@@ -243,40 +410,65 @@ async function generateConscienciaLetter(profileData, userName) {
     console.log(`[OPENAI_LETTER_GENERATION_ATTEMPT] Gerando Carta de Consciência para: ${userName}`);
     
     try {
+        // Preparar dados enriquecidos para o prompt
+        const imageAnalysis = profileData.profileImageAnalysis?.description || 'Não disponível';
+        const contentThemes = profileData.contentThemes?.join(', ') || 'Não disponível';
+        const googleInfo = profileData.additionalInfo?.googleSnippets?.join('\n') || 'Não disponível';
+        const linkedinProfile = profileData.linkedProfiles?.linkedin || 'Não disponível';
+        const hashtags = profileData.hashtags?.join(', ') || 'Não disponível';
+        const websiteUrl = profileData.websiteUrl || 'Não disponível';
+        const locationInfo = profileData.locationInfo || 'Não disponível';
+        const fallbackAnalysis = profileData.fallbackAnalysis || '';
+        
         // Preparar o prompt para a OpenAI
         const prompt = `
-        Você é o Conselheiro da Consciênc.IA, um assistente virtual especial criado para o evento MAPA DO LUCRO no Coworking Ikigai.
+        Você é o Conselheiro da Consciênc.IA, um assistente virtual especial criado para o evento MAPA DO LUCRO.
         
-        Sua tarefa é gerar uma "Carta de Consciência" personalizada para ${userName}, com base nos dados do perfil de Instagram @${profileData.username}.
+        Sua tarefa é gerar uma "Carta de Consciência" profundamente personalizada e emocionalmente impactante para ${userName}, com base nos dados enriquecidos do perfil digital @${profileData.username}.
         
-        Dados do perfil:
+        DADOS DETALHADOS DO PERFIL:
         - Nome: ${profileData.fullName || userName}
         - Bio: "${profileData.bio || 'Não disponível'}"
         - Seguidores: ${profileData.followersCount || 'Não disponível'}
         - Número de posts: ${profileData.postsCount || 'Não disponível'}
         - Conta comercial: ${profileData.isBusinessAccount ? 'Sim' : 'Não'}
         - Categoria de negócio: ${profileData.businessCategory || 'Não disponível'}
+        - Website: ${websiteUrl}
+        - Localização: ${locationInfo}
+        - Hashtags utilizados: ${hashtags}
+        - Temas de conteúdo identificados: ${contentThemes}
+        - Análise da imagem de perfil: ${imageAnalysis}
+        - Informações adicionais do Google: ${googleInfo}
+        - Perfil do LinkedIn: ${linkedinProfile}
+        ${fallbackAnalysis ? `- Análise alternativa: ${fallbackAnalysis}` : ''}
         
-        A Carta de Consciência deve ter quatro seções:
+        A Carta de Consciência deve ter quatro seções, cada uma com formatação visual rica, emojis relevantes e linguagem emocionalmente impactante:
         
-        1. PERFIL COMPORTAMENTAL (INSIGHT DE CONSCIÊNCIA):
-        Uma análise personalizada do comportamento e "pegada digital" do participante. Identifique traços de personalidade empreendedora, interesses e estilo de comunicação com base nos dados disponíveis. Seja respeitoso e construtivo, levando o participante a se enxergar de fora por um momento. Relacione com o conceito Ikigai (equilíbrio entre paixão, missão, vocação e profissão).
+        1. ✨ PERFIL COMPORTAMENTAL (INSIGHT DE CONSCIÊNCIA) ✨
+        Uma análise PROFUNDAMENTE personalizada do comportamento e "pegada digital" do participante. Identifique traços específicos de personalidade empreendedora, interesses e estilo de comunicação com base nos dados disponíveis. Seja respeitoso, mas surpreendentemente preciso, mencionando detalhes específicos que façam a pessoa pensar "como você sabe disso sobre mim?". Relacione com o conceito Ikigai (equilíbrio entre paixão, missão, vocação e profissão). Use emojis relevantes para destacar pontos-chave.
         
-        2. DICAS PRÁTICAS DE USO DE IA NOS NEGÓCIOS:
-        Ofereça 2-3 dicas sob medida de como esta pessoa pode alavancar Inteligência Artificial em seu negócio ou rotina profissional. Considere o ramo ou interesse detectado. Por exemplo, se for do setor de varejo, sugira ferramentas de IA para análise de tendências; se for prestador de serviço, indique uso de IA para automação de marketing. Seja específico e prático.
+        2. 🚀 DICAS PRÁTICAS DE USO DE IA NOS NEGÓCIOS 🚀
+        Ofereça 3 dicas extremamente específicas e sob medida de como esta pessoa pode alavancar Inteligência Artificial em seu negócio ou rotina profissional. Considere o ramo ou interesse detectado e mencione ferramentas reais e atuais de IA. Por exemplo, se for do setor de varejo, sugira ferramentas específicas de IA para análise de tendências; se for prestador de serviço, indique uso de IA para automação de marketing. Seja específico, prático e inovador. Use emojis para cada dica.
         
-        3. PÍLULA DE INSPIRAÇÃO (POESIA INDIVIDUALIZADA):
-        Crie uma breve poesia personalizada (4-6 linhas) para o participante, baseada em valores que a pessoa transparece, nome ou significado da marca, cidade natal, etc. Use metáforas relacionadas ao contexto da pessoa.
+        3. 💫 PÍLULA DE INSPIRAÇÃO (POESIA INDIVIDUALIZADA) 💫
+        Crie uma poesia verdadeiramente tocante e emocionante (6-8 linhas) para o participante. A poesia deve ser profundamente personalizada, baseada em valores que a pessoa transparece, nome ou significado da marca, cidade natal, etc. Use metáforas poderosas relacionadas ao contexto da pessoa. A poesia deve ter ritmo, rima e impacto emocional - algo que a pessoa queira compartilhar e guardar. Formate a poesia de forma visualmente atraente com emojis sutis.
         
-        4. RECOMENDAÇÕES ALINHADAS:
-        Conecte os insights do perfil e dicas de IA com os pilares do Método S.I.M. (ambiente, mindset, vendas, felicidade), com o conceito Ikigai e com o propósito do evento Mapa do Lucro. Dê recomendações motivacionais e estratégicas que reafirmem esses conceitos aplicados ao contexto do indivíduo.
+        4. 🧭 RECOMENDAÇÕES ALINHADAS 🧭
+        Conecte os insights do perfil e dicas de IA com os pilares do Método S.I.M. (ambiente, mindset, vendas, felicidade), com o conceito Ikigai e com o propósito do evento Mapa do Lucro. Dê recomendações motivacionais e estratégicas que reafirmem esses conceitos aplicados ao contexto específico do indivíduo. Seja inspirador e visionário, mostrando um caminho claro para o sucesso pessoal e profissional.
         
-        Importante:
-        - Mantenha um tom inspirador, positivo e profissional
-        - Seja específico e personalizado, evitando generalizações
-        - Limite cada seção a 1-2 parágrafos para manter a carta concisa
-        - Mencione o Programa Consciênc.IA de Renato Hilel e Nuno Arcanjo na conclusão
-        - Assine como "Conselheiro da Consciênc.IA"
+        FORMATAÇÃO E ESTILO:
+        - Use emojis relevantes e estratégicos para destacar pontos importantes e criar impacto visual
+        - Crie uma formatação visualmente atraente com espaçamento, negrito e itálico
+        - Utilize uma linguagem emocionalmente rica, inspiradora e impactante
+        - Seja extremamente específico e personalizado, evitando completamente generalizações
+        - Mencione detalhes específicos do perfil que causem surpresa e reconhecimento
+        - Escreva em português brasileiro, com expressões contemporâneas e naturais
+        - Termine com uma assinatura personalizada e inspiradora
+        
+        CONCLUSÃO:
+        Encerre a carta com uma mensagem inspiradora e um convite para conhecer o Programa Consciênc.IA de Renato Hilel e Nuno Arcanjo, visitando: https://www.floreon.app.br/conscienc-ia
+        
+        Assine como "✨ Conselheiro da Consciênc.IA ✨" com uma frase de efeito personalizada.
         `;
         
         // Gerar a carta usando a OpenAI
@@ -284,13 +476,18 @@ async function generateConscienciaLetter(profileData, userName) {
             model: "gpt-4",
             messages: [
                 { role: "system", content: prompt },
-                { role: "user", content: "Gere uma Carta de Consciência personalizada." }
+                { role: "user", content: "Gere uma Carta de Consciência personalizada que seja verdadeiramente impactante, específica e emocionante." }
             ],
-            max_tokens: 1500,
-            temperature: 0.7,
+            max_tokens: 2000,
+            temperature: 0.8,
         });
         
-        const letter = completion.choices[0].message.content;
+        // Formatar a carta para o WhatsApp
+        let letter = completion.choices[0].message.content;
+        
+        // Garantir que o link correto esteja na carta
+        letter = letter.replace(/https:\/\/consciencia\.ia/g, "https://www.floreon.app.br/conscienc-ia");
+        
         console.log(`[OPENAI_LETTER_GENERATION_SUCCESS] Carta gerada com sucesso para: ${userName}`);
         
         return letter;
@@ -520,13 +717,13 @@ app.post("/webhook", async (req, res) => {
                         };
                         
                         // Enviar mensagem de boas-vindas
-                        const welcomeMessage = `Olá! 👋 Bem-vindo(a) ao *Conselheiro da Consciênc.IA* do evento MAPA DO LUCRO no Coworking Ikigai!
+                        const welcomeMessage = `Olá! 👋 Bem-vindo(a) ao *Conselheiro da Consciênc.IA* do evento MAPA DO LUCRO!
 
 Sou um assistente virtual especial criado para gerar sua *Carta de Consciência* personalizada - uma análise única baseada no seu perfil digital que revelará insights valiosos sobre seu comportamento empreendedor e recomendações práticas para uso de IA em seus negócios.
 
 Para começar, preciso conhecer você melhor. 
 
-Por favor, me diga seu nome completo:`;
+Por favor, como gostaria de ser chamado(a)?`;
                         
                         await sendWhatsappMessage(userPhoneNumber, [welcomeMessage]);
                         
@@ -599,9 +796,9 @@ Vou analisar seu perfil @${userData.instagram} e gerar sua Carta de Consciência
 
 Para saber mais sobre como a IA pode transformar seu negócio e sua vida, conheça o *Programa Consciênc.IA* de Renato Hilel e Nuno Arcanjo.
 
-Visite: https://consciencia.ia
+Visite: https://www.floreon.app.br/conscienc-ia
 
-Aproveite o evento MAPA DO LUCRO e não deixe de conversar pessoalmente com os criadores do programa!`;
+Aproveite o evento MAPA DO LUCRO e não deixe de conversar pessoalmente com os criadores do programa! 💫`;
                             
                             await sendWhatsappMessage(userPhoneNumber, [finalMessage]);
                             
@@ -618,14 +815,72 @@ Aproveite o evento MAPA DO LUCRO e não deixe de conversar pessoalmente com os c
                             break;
                             
                         case "COMPLETED":
-                            // Usuário já completou o fluxo, enviar mensagem de retorno
-                            await sendWhatsappMessage(userPhoneNumber, [`Olá novamente, ${userData.name}! 👋
+                            // Usuário já completou o fluxo, mas pode continuar conversando com o Conselheiro
+                            
+                            // Registrar a pergunta do usuário
+                            if (!userData.conversations) {
+                                userData.conversations = [];
+                            }
+                            
+                            userData.conversations.push({
+                                timestamp: Date.now(),
+                                userMessage: messageText
+                            });
+                            
+                            // Enviar mensagem de processamento apenas se for uma pergunta complexa
+                            if (messageText.length > 50) {
+                                await sendWhatsappMessage(userPhoneNumber, [`Estou analisando sua pergunta, ${userData.name}... 🧠`]);
+                            }
+                            
+                            try {
+                                // Gerar resposta personalizada usando a OpenAI
+                                const assistantResponse = await openai.chat.completions.create({
+                                    model: "gpt-4",
+                                    messages: [
+                                        {
+                                            role: "system",
+                                            content: `Você é o Conselheiro da Consciênc.IA, um assistente virtual especializado em IA para negócios e desenvolvimento pessoal, criado para o evento MAPA DO LUCRO.
+                                            
+                                            Você já gerou uma Carta de Consciência personalizada para ${userData.name}, analisando seu perfil do Instagram @${userData.instagram}.
+                                            
+                                            Agora, você está em uma conversa contínua, respondendo perguntas e oferecendo orientações adicionais.
+                                            
+                                            Diretrizes:
+                                            - Mantenha um tom inspirador, positivo e profissional
+                                            - Use emojis relevantes para tornar a conversa mais envolvente
+                                            - Seja específico e personalizado em suas respostas
+                                            - Foque em orientações práticas sobre IA, negócios, desenvolvimento pessoal e profissional
+                                            - Quando relevante, mencione o Programa Consciênc.IA de Renato Hilel e Nuno Arcanjo (https://www.floreon.app.br/conscienc-ia)
+                                            - Mantenha suas respostas concisas (máximo 3 parágrafos)
+                                            - Escreva em português brasileiro, com expressões contemporâneas e naturais`
+                                        },
+                                        { role: "user", content: messageText }
+                                    ],
+                                    max_tokens: 500,
+                                    temperature: 0.7,
+                                });
+                                
+                                // Obter e formatar a resposta
+                                let response = assistantResponse.choices[0].message.content;
+                                
+                                // Garantir que o link correto esteja na resposta
+                                response = response.replace(/https:\/\/consciencia\.ia/g, "https://www.floreon.app.br/conscienc-ia");
+                                
+                                // Registrar a resposta do assistente
+                                userData.conversations[userData.conversations.length - 1].assistantResponse = response;
+                                
+                                // Enviar a resposta
+                                await sendWhatsappMessage(userPhoneNumber, [response]);
+                                
+                            } catch (error) {
+                                console.error(`[OPENAI_CONVERSATION_ERROR] Erro ao gerar resposta para ${userName}:`, safeLogError(error));
+                                
+                                // Enviar mensagem de fallback em caso de erro
+                                await sendWhatsappMessage(userPhoneNumber, [`Desculpe, ${userData.name}, estou com dificuldades para processar sua pergunta neste momento. 
 
-Você já recebeu sua Carta de Consciência personalizada. Se deseja mais informações sobre o Programa Consciênc.IA, visite:
-
-https://consciencia.ia
-
-Se tiver alguma dúvida específica, pode me perguntar e tentarei ajudar!`]);
+Por favor, tente novamente com uma pergunta diferente ou visite https://www.floreon.app.br/conscienc-ia para mais informações sobre o Programa Consciênc.IA. 🙏`]);
+                            }
+                            
                             break;
                             
                         default:
