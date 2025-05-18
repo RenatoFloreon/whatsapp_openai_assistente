@@ -1,4 +1,5 @@
-module.exports = (req, res) => {
+// api/webhook.js
+export default function handler(req, res) {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
   if (req.method === 'GET') {
@@ -22,4 +23,4 @@ module.exports = (req, res) => {
   }
 
   res.status(404).send('Método não suportado');
-};
+}
