@@ -1,14 +1,3 @@
-// Variáveis de ambiente (.env) necessárias para a aplicação:
-// WHATSAPP_TOKEN="EAAG..."
-// VERIFY_TOKEN="seu_token_de_verificacao"
-// WHATSAPP_PHONE_ID="123456789"       // ID numérico do telefone (Cloud API WhatsApp)
-// OPENAI_API_KEY="sk-..."            // Chave de API secreta da OpenAI
-// REDIS_URL="rediss://:<senha>@<host>:<port>"  // URL de conexão Redis (Upstash)
-// REDIS_TLS_REJECT_UNAUTHORIZED=false  // (opcional) 'false' para ignorar verificação TLS do Redis
-// KOMMO_API_KEY="token_api_kommo"    // Token da API Kommo CRM
-// KOMMO_ACCOUNT_ID="seu_id_conta_kommo" // ID numérico da conta Kommo
-// (Opcional) FETCH_TIMEOUT_MS=20000, OPENAI_TIMEOUT_MS=30000  // Timeouts em ms
-
 require("dotenv").config();
 const express = require("express");
 const crypto = require("crypto");
@@ -17,9 +6,13 @@ const Redis = require("ioredis");
 const fetch = require("node-fetch");
 const cheerio = require("cheerio");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const puppeteer = require("puppeteer");
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Configurações básicas
 const PORT = process.env.PORT || 3000;
@@ -57,7 +50,6 @@ let redis;
 if (REDIS_URL) {
     try {
         console.log(`[REDIS_INIT_ATTEMPT] Tentando inicializar o Redis com a URL: ${REDIS_URL.substring(0, REDIS_URL.indexOf("://") + 3)}... e REDIS_TLS_REJECT_UNAUTHORIZED: ${REDIS_TLS_REJECT_UNAUTHORIZED}`);
-        
         const redisOptions = {
             maxRetriesPerRequest: 3,
             connectTimeout: 15000,
@@ -67,18 +59,13 @@ if (REDIS_URL) {
                 return delay;
             }
         };
-
         if (REDIS_URL.startsWith("rediss://")) {
-            redisOptions.tls = {
-                rejectUnauthorized: REDIS_TLS_REJECT_UNAUTHORIZED,
-            };
+            redisOptions.tls = { rejectUnauthorized: REDIS_TLS_REJECT_UNAUTHORIZED };
             console.log("[REDIS_INIT_TLS_CONFIG] Configuração TLS para Redis: ", redisOptions.tls);
         } else {
             console.log("[REDIS_INIT_NO_TLS] Conectando ao Redis sem TLS (URL não começa com rediss://).");
         }
-
         redis = new Redis(REDIS_URL, redisOptions);
-
         redis.on("connect", () => console.log("[REDIS_EVENT] Conectado com sucesso ao Redis!"));
         redis.on("ready", () => console.log("[REDIS_EVENT] Cliente Redis pronto para uso."));
         redis.on("error", (err) => {
@@ -90,7 +77,6 @@ if (REDIS_URL) {
         redis.on("close", () => console.log("[REDIS_EVENT] Conexão com o Redis fechada."));
         redis.on("reconnecting", (delay) => console.log(`[REDIS_EVENT] Tentando reconectar ao Redis... Próxima tentativa em ${delay}ms`));
         redis.on("end", () => console.log("[REDIS_EVENT] Conexão com o Redis terminada (não haverá mais reconexões)."));
-
     } catch (error) {
         console.error("[REDIS_INIT_ERROR] Erro CRÍTICO ao inicializar o cliente Redis:", safeLogError(error));
         redis = null;
@@ -99,7 +85,13 @@ if (REDIS_URL) {
     console.error("[REDIS_INIT_ERROR] REDIS_URL não está definida. O Redis não será utilizado.");
 }
 
-// Função para logar erros de forma segura (remove detalhes sensíveis, ex: corpo das requisições)
+// Variáveis para Puppeteer e painel admin
+let browser;
+const ADMIN_USER = "consciencia";
+const ADMIN_PASS = "consciencia2025";
+let adminToken = crypto.randomBytes(16).toString('hex');
+
+// Função para logar erros de forma segura
 function safeLogError(error, additionalInfo = {}) {
     const errorDetails = {
         message: error.message,
@@ -118,7 +110,7 @@ function safeLogError(error, additionalInfo = {}) {
     return JSON.stringify(errorDetails, null, 2);
 }
 
-// Função para enviar mensagens WhatsApp (usando API do WhatsApp Cloud)
+// Função para enviar mensagens WhatsApp
 async function sendWhatsappMessage(phoneNumber, messageBlocks, attempt = 1, maxAttempts = 2) {
     if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) {
         console.error("[WHATSAPP_SEND_ERROR] WHATSAPP_TOKEN ou WHATSAPP_PHONE_ID não definidos. Não é possível enviar mensagem.");
@@ -131,7 +123,7 @@ async function sendWhatsappMessage(phoneNumber, messageBlocks, attempt = 1, maxA
             text: { body: messageBlocks[i] },
         };
         const chunkInfo = `Bloco ${i + 1}/${messageBlocks.length}`;
-        console.log(`[WHATSAPP_SEND_ATTEMPT] [${phoneNumber}] Enviando ${chunkInfo}: "${messageBlocks[i].substring(0, 50)}..."`);
+        console.log(`[WHATSAPP_SEND_ATTEMPT] [${phoneNumber}] Enviando ${chunkInfo}: "${messageBlocks[i].substring(0,50)}..."`);
         try {
             const response = await fetch(`https://graph.facebook.com/v19.0/${WHATSAPP_PHONE_ID}/messages`, {
                 method: "POST",
@@ -150,7 +142,6 @@ async function sendWhatsappMessage(phoneNumber, messageBlocks, attempt = 1, maxA
             console.log(`[WHATSAPP_SEND_SUCCESS] [${phoneNumber}] ${chunkInfo} enviado. Status: ${response.status}. Resposta: ${responseText}`);
         } catch (error) {
             console.error(`[WHATSAPP_SEND_ERROR] [${phoneNumber}] Erro de rede ao enviar ${chunkInfo}:`, safeLogError(error, { chunk_info: chunkInfo }));
-            // Tentar reenviar em caso de erro de timeout ou conexão, com pequena pausa
             if (attempt < maxAttempts && (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED' || error.code === 'ECONNRESET')) {
                 console.log(`[WHATSAPP_SEND_RETRY] [${phoneNumber}] Tentando novamente (${attempt + 1}/${maxAttempts}) para ${chunkInfo} em 2 segundos...`);
                 await new Promise(resolve => setTimeout(resolve, 2000));
@@ -159,21 +150,19 @@ async function sendWhatsappMessage(phoneNumber, messageBlocks, attempt = 1, maxA
                 console.error(`[WHATSAPP_SEND_FAIL] [${phoneNumber}] Falha final ao enviar ${chunkInfo} após ${attempt} tentativas.`);
             }
         }
-        // Pausa curta entre envios de blocos para evitar limite de throughput
         if (i < messageBlocks.length - 1) {
             await new Promise(resolve => setTimeout(resolve, 700));
         }
     }
 }
 
-// Função para extrair dados públicos do Instagram e enriquecer com outras fontes (LinkedIn, Google, análise de imagem)
+// Função para extrair dados públicos do Instagram e enriquecer com outras fontes
 async function scrapeInstagramProfile(username) {
     console.log(`[INSTAGRAM_SCRAPE_ATTEMPT] Tentando extrair dados do perfil: ${username}`);
     try {
-        // Removendo @ se existir no username
+        // Removendo @ se existir
         username = username.replace('@', '');
-        
-        // Objeto para armazenar todos os dados coletados do perfil
+        // Objeto para armazenar todos os dados coletados
         const profileData = {
             username: username,
             fullName: '',
@@ -191,61 +180,45 @@ async function scrapeInstagramProfile(username) {
             locationInfo: '',
             additionalInfo: {}
         };
-
-        // 1. Solicitar HTML do perfil do Instagram
-        const response = await axios.get(`https://www.instagram.com/${username}/`, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Cache-Control': 'max-age=0'
-            },
-            timeout: 15000
-        });
-
-        const $ = cheerio.load(response.data);
-        
-        // Extrair metadados do perfil (nome, bio, contagens, imagem de perfil)
-        const metaTags = $('meta');
-        metaTags.each((i, el) => {
+        // 1. Acessar página do Instagram com Puppeteer
+        if (!browser) {
+            browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+            console.log("[PUPPETEER] Navegador Puppeteer iniciado.");
+        }
+        const page = await browser.newPage();
+        await page.goto(`https://www.instagram.com/${username}/`, { waitUntil: 'networkidle2', timeout: 15000 });
+        const html = await page.content();
+        await page.close();
+        const $ = cheerio.load(html);
+        // Extrair metadados do perfil
+        $('meta').each((i, el) => {
             const property = $(el).attr('property');
+            const content = $(el).attr('content') || '';
             if (property === 'og:title') {
-                // content ex: "Nome da Pessoa (@usuario) • Instagram photos and videos"
-                profileData.fullName = $(el).attr('content').split(' (')[0];
+                profileData.fullName = content.split(' (')[0];
             }
             if (property === 'og:description') {
-                const content = $(el).attr('content');
                 if (content.includes('Followers') && content.includes('Following')) {
-                    // No og:description, o texto antes de "Followers" costuma ser a bio (ou parte dela)
                     profileData.bio = content.split('Followers')[0].trim();
-                    
-                    // Extrair contagem de seguidores
                     const followersMatch = content.match(/(\d+(?:,\d+)*) Followers/);
                     if (followersMatch) {
-                        profileData.followersCount = parseInt(followersMatch[1].replace(/,/g, ''));
+                        profileData.followersCount = parseInt(followersMatch[1].replace(/,/g, '')) || 0;
                     }
-                    
-                    // Extrair contagem de posts
                     const postsMatch = content.match(/(\d+(?:,\d+)*) Posts/);
                     if (postsMatch) {
-                        profileData.postsCount = parseInt(postsMatch[1].replace(/,/g, ''));
+                        profileData.postsCount = parseInt(postsMatch[1].replace(/,/g, '')) || 0;
                     }
                 }
             }
-            // Extrair URL da imagem de perfil
             if (property === 'og:image') {
-                profileData.profileImageUrl = $(el).attr('content');
+                profileData.profileImageUrl = content;
             }
         });
-
-        // Verificar se é uma conta comercial (existe botão "Contact")
+        // Verificar se é uma conta comercial (presença de botão "Contact" na página)
         if ($('a:contains("Contact")').length > 0) {
             profileData.isBusinessAccount = true;
         }
-
-        // Extrair categoria de negócio (exibida com "·" no perfil)
+        // Extrair categoria de negócio (aparece após um ponto "·" na página)
         const categoryElement = $('div:contains("·")').first();
         if (categoryElement.length > 0) {
             const categoryText = categoryElement.text();
@@ -253,41 +226,32 @@ async function scrapeInstagramProfile(username) {
                 profileData.businessCategory = categoryText.split('·')[1].trim();
             }
         }
-
-        // Extrair website/link externo na bio (primeiro link que não seja do instagram.com)
-        const linkElements = $('a[href^="http"]');
-        linkElements.each((i, el) => {
+        // Extrair website/link na bio (primeiro link externo encontrado)
+        $('a[href^="http"]').each((i, el) => {
             const href = $(el).attr('href');
             if (href && !href.includes('instagram.com')) {
                 profileData.websiteUrl = href;
-                return false; // interrompe após encontrar o primeiro link externo
+                return false; // parar após encontrar o primeiro link externo
             }
         });
-
         // Extrair hashtags da bio
-        const bioText = profileData.bio;
+        const bioText = profileData.bio || '';
         const hashtagRegex = /#(\w+)/g;
         let match;
         while ((match = hashtagRegex.exec(bioText)) !== null) {
             profileData.hashtags.push(match[1]);
         }
-
-        // Extrair localização (se houver emoji de localização na bio, ex: 📍 Cidade)
+        // Extrair localização da bio (se houver emoji de localização 📍)
         const locationElement = $('span:contains("📍")');
         if (locationElement.length > 0) {
             profileData.locationInfo = locationElement.text().replace('📍', '').trim();
         }
-
-        // 2. Buscar informações adicionais no Google (snippets públicos e perfil LinkedIn)
+        // 2. Buscar informações adicionais no Google (snippets públicos e LinkedIn)
         try {
             const googleResponse = await axios.get(`https://www.google.com/search?q=${encodeURIComponent(profileData.fullName || username)}`, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                }
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
             });
             const $google = cheerio.load(googleResponse.data);
-            
-            // Extrair trechos de resultado (snippets) do Google
             const snippets = [];
             $google('.VwiC3b').each((i, el) => {
                 const snippet = $google(el).text().trim();
@@ -298,8 +262,6 @@ async function scrapeInstagramProfile(username) {
             if (snippets.length > 0) {
                 profileData.additionalInfo.googleSnippets = snippets.slice(0, 3);
             }
-            
-            // Procurar link de perfil do LinkedIn nos resultados
             const linkedinLink = $google('a[href*="linkedin.com/in/"]').first().attr('href');
             if (linkedinLink) {
                 profileData.linkedProfiles.linkedin = linkedinLink;
@@ -307,8 +269,47 @@ async function scrapeInstagramProfile(username) {
         } catch (error) {
             console.log(`[GOOGLE_SEARCH_INFO] Não foi possível obter informações adicionais do Google: ${error.message}`);
         }
-
-        // 3. Analisar a imagem de perfil usando a OpenAI Vision (GPT-4 Vision), se disponível
+        // 3. Extrair informações das últimas postagens (imagens e legendas)
+        const postLinks = [];
+        $('article a[href*="/p/"]').slice(0, 3).each((i, el) => {
+            const href = $(el).attr('href');
+            if (href) {
+                postLinks.push(`https://www.instagram.com${href}`);
+            }
+        });
+        for (const postUrl of postLinks) {
+            try {
+                const postPage = await browser.newPage();
+                await postPage.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 10000 });
+                const postHtml = await postPage.content();
+                await postPage.close();
+                const $post = cheerio.load(postHtml);
+                const imageUrl = $post('meta[property="og:image"]').attr('content') || '';
+                let captionSnippet = $post('meta[property="og:description"]').attr('content') || '';
+                let captionText = captionSnippet;
+                const quoteStart = captionSnippet.indexOf('"');
+                const quoteEnd = captionSnippet.lastIndexOf('"');
+                if (quoteStart !== -1 && quoteEnd !== -1 && quoteEnd > quoteStart) {
+                    captionText = captionSnippet.substring(quoteStart + 1, quoteEnd);
+                }
+                // Extrair hashtags das legendas
+                const hashtagRegexPost = /#(\w+)/g;
+                let matchPost;
+                const captionHashtags = [];
+                while ((matchPost = hashtagRegexPost.exec(captionText)) !== null) {
+                    captionHashtags.push(matchPost[1]);
+                }
+                captionHashtags.forEach(tag => {
+                    if (!profileData.hashtags.includes(tag)) {
+                        profileData.hashtags.push(tag);
+                    }
+                });
+                profileData.recentPosts.push({ imageUrl: imageUrl, caption: captionText });
+            } catch (err) {
+                console.error('[INSTAGRAM_POST_SCRAPE_ERROR] Erro ao extrair dados de uma postagem:', err.message);
+            }
+        }
+        // 4. Analisar imagem de perfil via OpenAI (se disponível)
         if (profileData.profileImageUrl && openai) {
             try {
                 const imageAnalysisPrompt = `
@@ -321,17 +322,13 @@ async function scrapeInstagramProfile(username) {
                 
                 Forneça uma análise concisa em português.
                 `;
-                
                 const imageAnalysis = await openai.chat.completions.create({
                     model: "gpt-4-vision-preview",
                     messages: [
-                        {
-                            role: "user",
-                            content: [
-                                { type: "text", text: imageAnalysisPrompt },
-                                { type: "image_url", image_url: { url: profileData.profileImageUrl } }
-                            ]
-                        }
+                        { role: "user", content: [
+                            { type: "text", text: imageAnalysisPrompt },
+                            { type: "image_url", image_url: { url: profileData.profileImageUrl } }
+                        ]}
                     ],
                     max_tokens: 300
                 });
@@ -343,8 +340,7 @@ async function scrapeInstagramProfile(username) {
                 console.log(`[PROFILE_IMAGE_ANALYSIS_INFO] Não foi possível analisar a imagem de perfil: ${error.message}`);
             }
         }
-
-        // 4. Identificar principais temas de conteúdo/interesse a partir da bio e hashtags
+        // 5. Identificar temas de conteúdo (usando bio/hashtags coletados)
         try {
             if (openai && (profileData.bio || profileData.hashtags.length > 0)) {
                 const contentAnalysisPrompt = `
@@ -359,9 +355,7 @@ async function scrapeInstagramProfile(username) {
                 `;
                 const contentAnalysis = await openai.chat.completions.create({
                     model: "gpt-4",
-                    messages: [
-                        { role: "user", content: contentAnalysisPrompt }
-                    ],
+                    messages: [ { role: "user", content: contentAnalysisPrompt } ],
                     max_tokens: 100
                 });
                 const themes = contentAnalysis.choices[0].message.content.split(',').map(theme => theme.trim());
@@ -371,13 +365,11 @@ async function scrapeInstagramProfile(username) {
         } catch (error) {
             console.log(`[CONTENT_THEMES_ANALYSIS_INFO] Não foi possível identificar temas de conteúdo: ${error.message}`);
         }
-
         console.log(`[INSTAGRAM_SCRAPE_SUCCESS] Dados enriquecidos extraídos com sucesso para: ${username}`);
         return profileData;
     } catch (error) {
         console.error(`[INSTAGRAM_SCRAPE_ERROR] Erro ao extrair dados do perfil ${username}:`, safeLogError(error));
-        
-        // Fallback: gerar informações hipotéticas via OpenAI se o scraping falhar
+        // Mesmo com erro, tentar obter informações básicas via OpenAI
         try {
             if (openai) {
                 const fallbackAnalysisPrompt = `
@@ -388,9 +380,7 @@ async function scrapeInstagramProfile(username) {
                 `;
                 const fallbackAnalysis = await openai.chat.completions.create({
                     model: "gpt-4",
-                    messages: [
-                        { role: "user", content: fallbackAnalysisPrompt }
-                    ],
+                    messages: [ { role: "user", content: fallbackAnalysisPrompt } ],
                     max_tokens: 250
                 });
                 return {
@@ -402,18 +392,15 @@ async function scrapeInstagramProfile(username) {
         } catch (fallbackError) {
             console.error(`[FALLBACK_ANALYSIS_ERROR] Erro ao gerar análise alternativa: ${fallbackError.message}`);
         }
-        return {
-            username: username,
-            error: "Não foi possível extrair dados do perfil"
-        };
+        return { username: username, error: "Não foi possível extrair dados do perfil" };
     }
 }
 
-// Função para gerar a Carta de Consciência personalizada usando a OpenAI
+// Função para gerar a Carta de Consciência
 async function generateConscienciaLetter(profileData, userName) {
     console.log(`[OPENAI_LETTER_GENERATION_ATTEMPT] Gerando Carta de Consciência para: ${userName}`);
     try {
-        // Preparar dados enriquecidos para inserir no prompt
+        // Preparar dados enriquecidos para o prompt
         const imageAnalysis = profileData.profileImageAnalysis?.description || 'Não disponível';
         const contentThemes = profileData.contentThemes?.join(', ') || 'Não disponível';
         const googleInfo = profileData.additionalInfo?.googleSnippets?.join('\n') || 'Não disponível';
@@ -422,8 +409,7 @@ async function generateConscienciaLetter(profileData, userName) {
         const websiteUrl = profileData.websiteUrl || 'Não disponível';
         const locationInfo = profileData.locationInfo || 'Não disponível';
         const fallbackAnalysis = profileData.fallbackAnalysis || '';
-        
-        // Construir o prompt detalhado para geração da carta (instruções e dados do perfil)
+        // Preparar o prompt para a OpenAI
         const prompt = `
         Você é o Conselheiro da Consciênc.IA, um assistente virtual especial criado para o evento MAPA DO LUCRO.
         
@@ -438,7 +424,7 @@ async function generateConscienciaLetter(profileData, userName) {
         - Categoria de negócio: ${profileData.businessCategory || 'Não disponível'}
         - Website: ${websiteUrl}
         - Localização: ${locationInfo}
-        - Hashtags utilizados: ${hashtags}
+        - Hashtags utilizadas: ${hashtags}
         - Temas de conteúdo identificados: ${contentThemes}
         - Análise da imagem de perfil: ${imageAnalysis}
         - Informações adicionais do Google: ${googleInfo}
@@ -459,7 +445,7 @@ async function generateConscienciaLetter(profileData, userName) {
         4. 🧭 RECOMENDAÇÕES ALINHADAS 🧭
         Conecte os insights do perfil e dicas de IA com os pilares do Método S.I.M. (ambiente, mindset, vendas, felicidade), com o conceito Ikigai e com o propósito do evento Mapa do Lucro. Dê recomendações motivacionais e estratégicas que reafirmem esses conceitos aplicados ao contexto específico do indivíduo. Seja inspirador e visionário, mostrando um caminho claro para o sucesso pessoal e profissional.
         
-        FORMATAÇÃO E ESTILO:
+        FORMATAÇÃO e ESTILO:
         - Use emojis relevantes e estratégicos para destacar pontos importantes e criar impacto visual
         - Crie uma formatação visualmente atraente com espaçamento, negrito e itálico
         - Utilize uma linguagem emocionalmente rica, inspiradora e impactante
@@ -469,12 +455,10 @@ async function generateConscienciaLetter(profileData, userName) {
         - Termine com uma assinatura personalizada e inspiradora
         
         CONCLUSÃO:
-        Encerre a carta com uma mensagem inspiradora e um convite para conhecer o Programa Consciênc.IA de Renato Hilel e Nuno Arcanjo, visitando: https://www.floreon.app.br/conscienc-ia
-        
+        Encerre a carta com uma mensagem inspiradora e um convite para conhecer o Programa Consciênc.IA de Renato Hilel e Nuno Arcanjo (visite: https://www.floreon.app.br/conscienc-ia), sugerindo também explorar o Método S.I.M. (https://metodosim.com.br) e visitar o Coworking Ikigai (https://www.coworkingikigai.com.br) para aprofundar esses conceitos.
         Assine como "✨ Conselheiro da Consciênc.IA ✨" com uma frase de efeito personalizada.
         `;
-        
-        // Chamada à OpenAI para gerar a carta com base no prompt preparado
+        // Gerar a carta usando a OpenAI
         const completion = await openai.chat.completions.create({
             model: "gpt-4",
             messages: [
@@ -484,13 +468,9 @@ async function generateConscienciaLetter(profileData, userName) {
             max_tokens: 2000,
             temperature: 0.8,
         });
-        
-        // Obter o conteúdo gerado da carta
         let letter = completion.choices[0].message.content;
-        
-        // Substituir qualquer link abreviado pelo link completo correto
+        // Garantir substituição de links curtos pelo completo (se necessário)
         letter = letter.replace(/https:\/\/consciencia\.ia/g, "https://www.floreon.app.br/conscienc-ia");
-        
         console.log(`[OPENAI_LETTER_GENERATION_SUCCESS] Carta gerada com sucesso para: ${userName}`);
         return letter;
     } catch (error) {
@@ -499,7 +479,7 @@ async function generateConscienciaLetter(profileData, userName) {
     }
 }
 
-// Função para adicionar lead (contato) ao Kommo CRM
+// Função para adicionar lead ao Kommo CRM
 async function addLeadToKommo(userData) {
     if (!KOMMO_API_KEY || !KOMMO_ACCOUNT_ID) {
         console.log("[KOMMO_INFO] KOMMO_API_KEY ou KOMMO_ACCOUNT_ID não definidos. Pulando integração com Kommo.");
@@ -507,64 +487,38 @@ async function addLeadToKommo(userData) {
     }
     console.log(`[KOMMO_ADD_LEAD_ATTEMPT] Adicionando lead ao Kommo: ${userData.name}`);
     try {
-        // Preparar dados do contato
         const contactData = {
             name: userData.name,
             custom_fields_values: [
-                {
-                    field_id: 1, // ID do campo de telefone no Kommo
-                    values: [{ value: userData.phone }]
-                }
+                { field_id: 1, values: [ { value: userData.phone } ] }
             ]
         };
         if (userData.email) {
-            contactData.custom_fields_values.push({
-                field_id: 2, // ID do campo de email no Kommo
-                values: [{ value: userData.email }]
-            });
+            contactData.custom_fields_values.push({ field_id: 2, values: [ { value: userData.email } ] });
         }
         if (userData.instagram) {
-            contactData.custom_fields_values.push({
-                field_id: 3, // ID do campo de Instagram no Kommo
-                values: [{ value: userData.instagram }]
-            });
+            contactData.custom_fields_values.push({ field_id: 3, values: [ { value: userData.instagram } ] });
         }
-        // Enviar requisição para adicionar contato
         const contactResponse = await axios.post(
             `https://${KOMMO_ACCOUNT_ID}.kommo.com/api/v4/contacts`,
             { add: [contactData] },
-            {
-                headers: {
-                    'Authorization': `Bearer ${KOMMO_API_KEY}`,
-                    'Content-Type': 'application/json'
-                }
-            }
+            { headers: { 'Authorization': `Bearer ${KOMMO_API_KEY}`, 'Content-Type': 'application/json' } }
         );
         if (!contactResponse.data || !contactResponse.data._embedded || !contactResponse.data._embedded.contacts) {
             console.error(`[KOMMO_ERROR] Resposta inválida ao adicionar contato: ${JSON.stringify(contactResponse.data)}`);
             return false;
         }
-        // Obter ID do contato recém-adicionado
         const contactId = contactResponse.data._embedded.contacts[0].id;
-        // Preparar dados do lead associando o contato
         const leadData = {
             name: `Lead do evento MAPA DO LUCRO - ${userData.name}`,
             price: 0,
-            status_id: 142, // ID do status "Novo Lead" no Kommo (exemplo)
-            _embedded: {
-                contacts: [{ id: contactId }]
-            }
+            status_id: 142, // ID do status "Novo Lead"
+            _embedded: { contacts: [ { id: contactId } ] }
         };
-        // Enviar requisição para adicionar lead
         const leadResponse = await axios.post(
             `https://${KOMMO_ACCOUNT_ID}.kommo.com/api/v4/leads`,
             { add: [leadData] },
-            {
-                headers: {
-                    'Authorization': `Bearer ${KOMMO_API_KEY}`,
-                    'Content-Type': 'application/json'
-                }
-            }
+            { headers: { 'Authorization': `Bearer ${KOMMO_API_KEY}`, 'Content-Type': 'application/json' } }
         );
         if (!leadResponse.data || !leadResponse.data._embedded || !leadResponse.data._embedded.leads) {
             console.error(`[KOMMO_ERROR] Resposta inválida ao adicionar lead: ${JSON.stringify(leadResponse.data)}`);
@@ -578,7 +532,7 @@ async function addLeadToKommo(userData) {
     }
 }
 
-// Função para dividir mensagens muito longas em blocos menores (limite do WhatsApp ~1000 caracteres por mensagem)
+// Função para dividir mensagens longas
 function splitMessage(text, maxLength = 1000) {
     if (text.length <= maxLength) return [text];
     const chunks = [];
@@ -590,7 +544,6 @@ function splitMessage(text, maxLength = 1000) {
         } else {
             if (currentChunk) chunks.push(currentChunk);
             if (paragraph.length > maxLength) {
-                // Se o parágrafo for maior que o tamanho máximo, dividir em sentenças
                 const sentences = paragraph.split(/(?<=\.|\?|\!) /);
                 currentChunk = "";
                 for (const sentence of sentences) {
@@ -599,7 +552,6 @@ function splitMessage(text, maxLength = 1000) {
                     } else {
                         if (currentChunk) chunks.push(currentChunk);
                         if (sentence.length > maxLength) {
-                            // Se a sentença ainda for muito longa, quebrar em partes fixas
                             let remainingSentence = sentence;
                             while (remainingSentence.length > 0) {
                                 const chunk = remainingSentence.substring(0, maxLength);
@@ -621,9 +573,13 @@ function splitMessage(text, maxLength = 1000) {
     return chunks;
 }
 
-// Rotas da API
+// Middleware simples para checar auth admin
+function checkAdminAuth(req) {
+    const cookies = req.headers.cookie ? Object.fromEntries(req.headers.cookie.split(';').map(c => c.trim().split('='))) : {};
+    return cookies['adminAuth'] === adminToken;
+}
 
-// Rota de verificação do webhook (GET) - usada pelo WhatsApp para validar o endpoint
+// Rotas da API (Webhook do WhatsApp)
 app.get("/webhook", (req, res) => {
     console.log("[WEBHOOK_VERIFICATION_HANDLER_START]", req.method, req.url, "Verificação de webhook recebida.");
     const mode = req.query["hub.mode"];
@@ -637,19 +593,17 @@ app.get("/webhook", (req, res) => {
             console.error("[WEBHOOK_VERIFICATION_FAILED] Falha na verificação do webhook. Modo ou token inválidos.");
             return res.sendStatus(403);
         }
-    } else {
-        console.error("[WEBHOOK_VERIFICATION_MISSING_PARAMS] Parâmetros 'hub.mode' ou 'hub.verify_token' ausentes.");
-        return res.sendStatus(400);
     }
+    console.error("[WEBHOOK_VERIFICATION_MISSING_PARAMS] Parâmetros 'hub.mode' ou 'hub.verify_token' ausentes.");
+    res.sendStatus(400);
 });
 
-// Rota principal do webhook (POST) - recebe mensagens do WhatsApp
 app.post("/webhook", async (req, res) => {
     console.log("[WEBHOOK_HANDLER_START] Webhook recebido.");
     try {
         const body = req.body;
-        if (!body || !body.object || body.object !== "whatsapp_business_account") {
-            console.error("[WEBHOOK_INVALID_REQUEST] Requisição inválida recebida:", JSON.stringify(body));
+        if (!body || body.object !== "whatsapp_business_account") {
+            console.error("[WEBHOOK_INVALID_REQUEST] Requisição inválida:", JSON.stringify(body));
             return res.sendStatus(400);
         }
         if (!body.entry || !body.entry.length) {
@@ -662,14 +616,11 @@ app.post("/webhook", async (req, res) => {
             for (const change of entry.changes) {
                 if (!change.value || !change.value.messages || !change.value.messages.length) continue;
                 for (const message of change.value.messages) {
-                    // Processar apenas mensagens de texto recebidas de usuários
                     if (message.type !== "text" || !message.from) continue;
-                    
                     const userPhoneNumber = message.from;
                     const messageText = message.text.body;
                     console.log(`[WEBHOOK_MESSAGE_RECEIVED] Mensagem recebida de ${userPhoneNumber}: "${messageText}"`);
-                    
-                    // Recuperar dados do usuário (estado da conversa) do Redis, se existir
+                    // Verificar se o usuário já existe no Redis
                     let userData = null;
                     const userKey = `evento:user_data:${userPhoneNumber}`;
                     if (redis) {
@@ -686,26 +637,22 @@ app.post("/webhook", async (req, res) => {
                             console.error(`[REDIS_GET_ERROR] Erro ao obter dados do usuário ${userPhoneNumber}:`, safeLogError(error));
                         }
                     }
-                    
-                    // Se o usuário não existe no banco (primeiro contato), iniciar novo registro
+                    // Se o usuário não existe, criar novo registro
                     if (!userData) {
                         userData = {
                             phone: userPhoneNumber,
                             state: "WELCOME",
                             startTime: Date.now(),
-                            completed: false,
-                            firstInteractionSent: false
+                            completed: false
                         };
-                        // Enviar mensagem de boas-vindas inicial
                         const welcomeMessage = `Olá! 👋 Bem-vindo(a) ao *Conselheiro da Consciênc.IA* do evento MAPA DO LUCRO!
-
+                        
 Sou um assistente virtual especial criado para gerar sua *Carta de Consciência* personalizada - uma análise única baseada no seu perfil digital que revelará insights valiosos sobre seu comportamento empreendedor e recomendações práticas para uso de IA em seus negócios.
 
 Para começar, preciso conhecer você melhor. 
 
 Por favor, como gostaria de ser chamado(a)?`;
                         await sendWhatsappMessage(userPhoneNumber, [welcomeMessage]);
-                        // Salvar dados iniciais do usuário no Redis
                         if (redis) {
                             try {
                                 console.log(`[REDIS_SET_ATTEMPT] Tentando salvar dados do novo usuário: ${userPhoneNumber}`);
@@ -715,54 +662,9 @@ Por favor, como gostaria de ser chamado(a)?`;
                                 console.error(`[REDIS_SET_ERROR] Erro ao salvar dados do usuário ${userPhoneNumber}:`, safeLogError(error));
                             }
                         }
-                        // Pular restante do processamento desta mensagem (aguardar próxima resposta do usuário)
                         continue;
                     }
-
-                    // ** Verificar comando manual de reset via WhatsApp **
-                    const normalizedText = messageText.normalize('NFD').replace(/[\u0300-\u036f]/g, "").toLowerCase();
-                    if (normalizedText === "resetarconsciencia") {
-                        console.log(`[RESET_COMMAND_RECEIVED] Usuário ${userPhoneNumber} solicitou reset do fluxo.`);
-                        // Apagar dados do usuário no Redis (reset completo)
-                        if (redis) {
-                            try {
-                                await redis.del(userKey);
-                                console.log(`[REDIS_DELETE_SUCCESS] Dados do usuário ${userPhoneNumber} apagados do Redis.`);
-                            } catch (error) {
-                                console.error(`[REDIS_DELETE_ERROR] Erro ao deletar dados do usuário ${userPhoneNumber}:`, safeLogError(error));
-                            }
-                        }
-                        // Reiniciar os dados locais do usuário
-                        userData = {
-                            phone: userPhoneNumber,
-                            state: "WELCOME",
-                            startTime: Date.now(),
-                            completed: false,
-                            firstInteractionSent: false
-                        };
-                        // Reenviar mensagem de boas-vindas (reinício do fluxo)
-                        const welcomeMessage = `Olá! 👋 Bem-vindo(a) ao *Conselheiro da Consciênc.IA* do evento MAPA DO LUCRO!
-
-Sou um assistente virtual especial criado para gerar sua *Carta de Consciência* personalizada - uma análise única baseada no seu perfil digital que revelará insights valiosos sobre seu comportamento empreendedor e recomendações práticas para uso de IA em seus negócios.
-
-Para começar, preciso conhecer você melhor. 
-
-Por favor, como gostaria de ser chamado(a)?`;
-                        await sendWhatsappMessage(userPhoneNumber, [welcomeMessage]);
-                        // Salvar novo estado do usuário no Redis
-                        if (redis) {
-                            try {
-                                await redis.set(userKey, JSON.stringify(userData));
-                                console.log(`[REDIS_SET_SUCCESS] Dados do usuário reiniciado salvos: ${userPhoneNumber}`);
-                            } catch (error) {
-                                console.error(`[REDIS_SET_ERROR] Erro ao salvar dados reiniciados do usuário ${userPhoneNumber}:`, safeLogError(error));
-                            }
-                        }
-                        // Não processeguir com outras lógicas para esta mensagem (fluxo reiniciado)
-                        continue;
-                    }
-
-                    // Processar a mensagem de acordo com o estado atual do usuário
+                    // Processar a mensagem com base no estado atual do usuário
                     switch (userData.state) {
                         case "WELCOME":
                             // Usuário enviou o nome
@@ -774,9 +676,8 @@ Para que possamos enviar materiais adicionais e manter contato após o evento, p
 
 (Se preferir não compartilhar seu e-mail agora, pode digitar "pular" para continuar)`]);
                             break;
-
                         case "ASK_EMAIL":
-                            // Usuário enviou o email (ou digitou "pular")
+                            // Usuário enviou o email
                             if (messageText.toLowerCase() !== "pular") {
                                 userData.email = messageText.trim();
                             }
@@ -787,45 +688,212 @@ Por favor, me informe seu nome de usuário no Instagram (com ou sem @):
 
 Exemplo: @consciencia.ia`]);
                             break;
-
                         case "ASK_INSTAGRAM":
-                            // Usuário enviou o perfil do Instagram
-                            userData.instagram = messageText.trim().replace(/^@/, '');
-                            userData.state = "GENERATING_LETTER";
-                            await sendWhatsappMessage(userPhoneNumber, [`Obrigado! Estou processando sua solicitação, aguarde um momento...
-
-Vou analisar seu perfil @${userData.instagram} e gerar sua Carta de Consciência personalizada. Isso pode levar alguns instantes.`]);
-                            // Coletar dados do Instagram e outras fontes
-                            const profileData = await scrapeInstagramProfile(userData.instagram);
-                            // Gerar a Carta de Consciência personalizada
-                            const letter = await generateConscienciaLetter(profileData, userData.name);
-                            // Dividir a carta em partes enviáveis (se muito longa)
-                            const letterBlocks = splitMessage(letter);
-                            // Enviar cada parte da carta para o usuário
-                            await sendWhatsappMessage(userPhoneNumber, letterBlocks);
-                            // Enviar mensagem final de conclusão
-                            const finalMessage = `Espero que tenha gostado da sua Carta de Consciência personalizada! 🌟
+                            // Usuário enviou o perfil do Instagram ou deseja pular
+                            const igInput = messageText.trim();
+                            if (igInput.toLowerCase() === "pular" || igInput.toLowerCase().includes("não tenho")) {
+                                // Usuário optou por não fornecer Instagram
+                                userData.instagram = null;
+                                userData.state = "GENERATING_LETTER";
+                                await sendWhatsappMessage(userPhoneNumber, [`Tudo bem! Não usaremos dados públicos adicionais. Estou gerando sua Carta de Consciência com base apenas nas informações fornecidas... ✨`]);
+                                // Criar profileData mínimo e gerar carta
+                                const minimalProfile = { username: "", fullName: userData.name, bio: "", hashtags: [], contentThemes: [], profileImageAnalysis: {}, additionalInfo: {}, linkedProfiles: {} };
+                                const letter = await generateConscienciaLetter(minimalProfile, userData.name);
+                                const letterBlocks = splitMessage(letter);
+                                await sendWhatsappMessage(userPhoneNumber, letterBlocks);
+                                const finalMsg = `Espero que tenha gostado da sua Carta de Consciência personalizada! 🌟
 
 Para saber mais sobre como a IA pode transformar seu negócio e sua vida, conheça o *Programa Consciênc.IA* de Renato Hilel e Nuno Arcanjo.
 
 Visite: https://www.floreon.app.br/conscienc-ia
 
 Aproveite o evento MAPA DO LUCRO e não deixe de conversar pessoalmente com os criadores do programa! 💫`;
-                            await sendWhatsappMessage(userPhoneNumber, [finalMessage]);
-                            // Atualizar estado do usuário para COMPLETED (fluxo concluído)
-                            userData.state = "COMPLETED";
-                            userData.completed = true;
-                            userData.completionTime = Date.now();
-                            userData.firstInteractionSent = false;  // reset da flag para a próxima pergunta do usuário
-                            // Integrar lead ao Kommo CRM
-                            if (KOMMO_API_KEY && KOMMO_ACCOUNT_ID) {
-                                await addLeadToKommo(userData);
+                                await sendWhatsappMessage(userPhoneNumber, [finalMsg]);
+                                // Finalizar fluxo do usuário
+                                userData.state = "COMPLETED";
+                                userData.completed = true;
+                                userData.completionTime = Date.now();
+                                userData.letter = letter;
+                                userData.conversations = []; // nenhuma pergunta extra feita
+                                userData.questionsCount = 0;
+                                // Salvar lead em JSON temporário
+                                try {
+                                    const leadsDir = path.join(__dirname, 'leads');
+                                    fs.mkdirSync(leadsDir, { recursive: true });
+                                    const leadFile = path.join(leadsDir, `${userData.phone}.json`);
+                                    const leadData = {
+                                        name: userData.name,
+                                        phone: userData.phone,
+                                        email: userData.email || '',
+                                        instagram: userData.instagram || '',
+                                        startTime: userData.startTime,
+                                        completionTime: userData.completionTime,
+                                        questionsCount: 0,
+                                        letter: userData.letter
+                                    };
+                                    fs.writeFileSync(leadFile, JSON.stringify(leadData, null, 2));
+                                    // Remover leads antigos (TTL manual de 7 dias)
+                                    const TTL_DAYS = 7;
+                                    const now = Date.now();
+                                    fs.readdirSync(leadsDir).forEach(file => {
+                                        const filePath = path.join(leadsDir, file);
+                                        const stats = fs.statSync(filePath);
+                                        if (now - stats.mtimeMs > TTL_DAYS * 24 * 60 * 60 * 1000) {
+                                            fs.unlinkSync(filePath);
+                                        }
+                                    });
+                                } catch (err) {
+                                    console.error("[LEADS_SAVE_ERROR] Erro ao salvar lead em JSON:", err);
+                                }
+                                // Integrar com Kommo CRM (se configurado)
+                                if (KOMMO_API_KEY && KOMMO_ACCOUNT_ID) {
+                                    await addLeadToKommo(userData);
+                                }
+                                break;
+                            }
+                            // Usuário forneceu Instagram - solicitar permissão para scraping
+                            userData.instagram = igInput.replace(/^@/, '');
+                            userData.state = "ASK_PERMISSION";
+                            await sendWhatsappMessage(userPhoneNumber, [`Podemos buscar informações públicas na internet (Instagram, LinkedIn etc.) para tornar sua Carta ainda mais especial? Seus dados **não** serão armazenados, apenas usados para esta experiência.\n\n(Responda com *Sim* ou *Não*)`]);
+                            break;
+                        case "ASK_PERMISSION":
+                            // Usuário respondeu sobre permissão de uso de dados públicos
+                            const answer = messageText.trim().toLowerCase();
+                            userData.state = "GENERATING_LETTER";
+                            if (answer.startsWith("s")) {
+                                // Usuário autorizou scraping
+                                await sendWhatsappMessage(userPhoneNumber, [`Ótimo! Vou analisar seus dados públicos e preparar sua carta. ⏳`]);
+                                const profileData = await scrapeInstagramProfile(userData.instagram);
+                                const letter = await generateConscienciaLetter(profileData, userData.name);
+                                const letterBlocks = splitMessage(letter);
+                                await sendWhatsappMessage(userPhoneNumber, letterBlocks);
+                                const finalMsg = `Espero que tenha gostado da sua Carta de Consciência personalizada! 🌟
+
+Para saber mais sobre como a IA pode transformar seu negócio e sua vida, conheça o *Programa Consciênc.IA* de Renato Hilel e Nuno Arcanjo.
+
+Visite: https://www.floreon.app.br/conscienc-ia
+
+Aproveite o evento MAPA DO LUCRO e não deixe de conversar pessoalmente com os criadores do programa! 💫`;
+                                await sendWhatsappMessage(userPhoneNumber, [finalMsg]);
+                                // Finalizar fluxo
+                                userData.state = "COMPLETED";
+                                userData.completed = true;
+                                userData.completionTime = Date.now();
+                                userData.letter = letter;
+                                userData.questionsCount = 0;
+                                if (!userData.conversations) userData.conversations = [];
+                                // Salvar lead em JSON
+                                try {
+                                    const leadsDir = path.join(__dirname, 'leads');
+                                    fs.mkdirSync(leadsDir, { recursive: true });
+                                    const leadFile = path.join(leadsDir, `${userData.phone}.json`);
+                                    const leadData = {
+                                        name: userData.name,
+                                        phone: userData.phone,
+                                        email: userData.email || '',
+                                        instagram: userData.instagram || '',
+                                        startTime: userData.startTime,
+                                        completionTime: userData.completionTime,
+                                        questionsCount: 0,
+                                        letter: userData.letter
+                                    };
+                                    fs.writeFileSync(leadFile, JSON.stringify(leadData, null, 2));
+                                    // Expirar leads antigos (TTL manual)
+                                    const TTL_DAYS = 7;
+                                    const now = Date.now();
+                                    fs.readdirSync(leadsDir).forEach(file => {
+                                        const filePath = path.join(leadsDir, file);
+                                        const stats = fs.statSync(filePath);
+                                        if (now - stats.mtimeMs > TTL_DAYS * 24 * 60 * 60 * 1000) {
+                                            fs.unlinkSync(filePath);
+                                        }
+                                    });
+                                } catch (err) {
+                                    console.error("[LEADS_SAVE_ERROR] Erro ao salvar lead em JSON:", err);
+                                }
+                                if (KOMMO_API_KEY && KOMMO_ACCOUNT_ID) {
+                                    await addLeadToKommo(userData);
+                                }
+                            } else {
+                                // Usuário NÃO autorizou scraping
+                                await sendWhatsappMessage(userPhoneNumber, [`Tudo bem! Não utilizaremos dados da internet. Estou gerando sua carta com as informações disponíveis... ✨`]);
+                                let profileData;
+                                if (openai) {
+                                    try {
+                                        const fallbackPrompt = `
+                                        Gere informações hipotéticas plausíveis para um perfil de Instagram com o nome de usuário @${userData.instagram}.
+                                        Inclua: possível nome completo, bio provável, tipo de conteúdo que provavelmente compartilha, e se é pessoal ou profissional. Baseie-se apenas no nome de usuário.
+                                        Responda em português.
+                                        `;
+                                        const fallbackRes = await openai.chat.completions.create({
+                                            model: "gpt-4",
+                                            messages: [ { role: "user", content: fallbackPrompt } ],
+                                            max_tokens: 250
+                                        });
+                                        profileData = {
+                                            username: userData.instagram,
+                                            fallbackAnalysis: fallbackRes.choices[0].message.content,
+                                            error: "Usuário optou por não utilizar dados públicos"
+                                        };
+                                    } catch (err) {
+                                        profileData = { username: userData.instagram };
+                                    }
+                                } else {
+                                    profileData = { username: userData.instagram };
+                                }
+                                const letter = await generateConscienciaLetter(profileData, userData.name);
+                                const letterBlocks = splitMessage(letter);
+                                await sendWhatsappMessage(userPhoneNumber, letterBlocks);
+                                const finalMsg = `Espero que tenha gostado da sua Carta de Consciência personalizada! 🌟
+
+Para saber mais sobre como a IA pode transformar seu negócio e sua vida, conheça o *Programa Consciênc.IA* de Renato Hilel e Nuno Arcanjo.
+
+Visite: https://www.floreon.app.br/conscienc-ia
+
+Aproveite o evento MAPA DO LUCRO e não deixe de conversar pessoalmente com os criadores do programa! 💫`;
+                                await sendWhatsappMessage(userPhoneNumber, [finalMsg]);
+                                // Finalizar fluxo
+                                userData.state = "COMPLETED";
+                                userData.completed = true;
+                                userData.completionTime = Date.now();
+                                userData.letter = letter;
+                                userData.questionsCount = 0;
+                                if (!userData.conversations) userData.conversations = [];
+                                try {
+                                    const leadsDir = path.join(__dirname, 'leads');
+                                    fs.mkdirSync(leadsDir, { recursive: true });
+                                    const leadFile = path.join(leadsDir, `${userData.phone}.json`);
+                                    const leadData = {
+                                        name: userData.name,
+                                        phone: userData.phone,
+                                        email: userData.email || '',
+                                        instagram: userData.instagram || '',
+                                        startTime: userData.startTime,
+                                        completionTime: userData.completionTime,
+                                        questionsCount: 0,
+                                        letter: userData.letter
+                                    };
+                                    fs.writeFileSync(leadFile, JSON.stringify(leadData, null, 2));
+                                    // Limpeza de arquivos antigos
+                                    const TTL_DAYS = 7;
+                                    const now = Date.now();
+                                    fs.readdirSync(leadsDir).forEach(file => {
+                                        const filePath = path.join(leadsDir, file);
+                                        const stats = fs.statSync(filePath);
+                                        if (now - stats.mtimeMs > TTL_DAYS * 24 * 60 * 60 * 1000) {
+                                            fs.unlinkSync(filePath);
+                                        }
+                                    });
+                                } catch (err) {
+                                    console.error("[LEADS_SAVE_ERROR] Erro ao salvar lead em JSON:", err);
+                                }
+                                if (KOMMO_API_KEY && KOMMO_ACCOUNT_ID) {
+                                    await addLeadToKommo(userData);
+                                }
                             }
                             break;
-
                         case "COMPLETED":
-                            // Usuário já concluiu o fluxo da carta e enviou uma pergunta adicional
-                            // Registrar a pergunta do usuário no histórico
+                            // Usuário já completou o fluxo e está fazendo perguntas adicionais
                             if (!userData.conversations) {
                                 userData.conversations = [];
                             }
@@ -833,13 +901,15 @@ Aproveite o evento MAPA DO LUCRO e não deixe de conversar pessoalmente com os c
                                 timestamp: Date.now(),
                                 userMessage: messageText
                             });
-                            // Enviar mensagem de processamento (uma única vez, na primeira pergunta após a carta)
-                            if (!userData.firstInteractionSent) {
-                                await sendWhatsappMessage(userPhoneNumber, [`Estou analisando sua pergunta, ${userData.name}. 🧠`]);
-                                userData.firstInteractionSent = true;
+                            // Mostrar mensagem de processamento apenas na primeira pergunta após a carta
+                            if (userData.conversations.length === 1) {
+                                const msgLower = messageText.toLowerCase();
+                                if (messageText.length > 50 || msgLower.includes("?")) {
+                                    await sendWhatsappMessage(userPhoneNumber, [`Estou analisando sua pergunta, ${userData.name}... 🧠`]);
+                                }
                             }
                             try {
-                                // Gerar resposta personalizada usando a OpenAI (contextualizada com a Carta já fornecida)
+                                // Gerar resposta personalizada usando OpenAI
                                 const assistantResponse = await openai.chat.completions.create({
                                     model: "gpt-4",
                                     messages: [
@@ -865,33 +935,28 @@ Diretrizes:
                                     max_tokens: 500,
                                     temperature: 0.7,
                                 });
-                                // Obter e formatar a resposta do assistente
                                 let response = assistantResponse.choices[0].message.content;
-                                // Garantir que o link do programa esteja correto na resposta
                                 response = response.replace(/https:\/\/consciencia\.ia/g, "https://www.floreon.app.br/conscienc-ia");
-                                // Salvar a resposta do assistente no histórico da conversa
+                                // Registrar a resposta do assistente
                                 userData.conversations[userData.conversations.length - 1].assistantResponse = response;
-                                // Enviar a resposta ao usuário no WhatsApp
+                                // Enviar a resposta para o usuário
                                 await sendWhatsappMessage(userPhoneNumber, [response]);
                             } catch (error) {
                                 console.error(`[OPENAI_CONVERSATION_ERROR] Erro ao gerar resposta para ${userData.name}:`, safeLogError(error));
-                                // Resposta de fallback em caso de erro na geração da resposta
-                                await sendWhatsappMessage(userPhoneNumber, [`Desculpe, ${userData.name}, estou com dificuldades para processar sua pergunta neste momento. 
+                                await sendWhatsappMessage(userPhoneNumber, [`Desculpe, ${userData.name}, estou com dificuldades para processar sua pergunta no momento. 
 
 Por favor, tente novamente mais tarde ou visite https://www.floreon.app.br/conscienc-ia para mais informações sobre o Programa Consciênc.IA. 🙏`]);
                             }
                             break;
-
                         default:
-                            // Qualquer estado desconhecido: reiniciar conversa
+                            // Estado desconhecido: resetar para o início
                             userData.state = "WELCOME";
                             await sendWhatsappMessage(userPhoneNumber, [`Desculpe, ocorreu um erro no processamento. Vamos recomeçar.
 
 Por favor, me diga seu nome completo:`]);
                             break;
                     }
-
-                    // Após processar a mensagem, salvar os dados atualizados do usuário no Redis
+                    // Salvar dados atualizados do usuário no Redis
                     if (redis) {
                         try {
                             console.log(`[REDIS_SET_ATTEMPT] Tentando atualizar dados do usuário: ${userPhoneNumber}, estado: ${userData.state}`);
@@ -904,7 +969,6 @@ Por favor, me diga seu nome completo:`]);
                 }
             }
         }
-        // Retornar status 200 OK para indicar que recebemos e processamos com sucesso
         res.sendStatus(200);
     } catch (error) {
         console.error("[WEBHOOK_ERROR] Erro ao processar webhook:", safeLogError(error));
@@ -912,19 +976,140 @@ Por favor, me diga seu nome completo:`]);
     }
 });
 
-// Rota simples de saúde (health check)
+// Rota de verificação de saúde
 app.get("/", (req, res) => {
     console.log("[HEALTH_CHECK] GET / recebido.");
-    res.send("Servidor do assistente WhatsApp-OpenAI está ativo e a escutar!");
+    res.send("Servidor do assistente WhatsApp-OpenAI está ativo e a escuta!");
 });
 
-// Rota de administração (apenas informativa nesta implementação)
-app.get("/admin", (req, res) => {
-    // Esta rota poderia ser implementada pelo painel administrativo separado (Flask/React)
-    res.send("Painel administrativo disponível em um servidor separado.");
+// ** Rotas do Painel Administrativo **
+
+// Configurar view engine para EJS (as views estarão no diretório 'views')
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+
+// Rota de login (GET)
+app.get("/admin/login", (req, res) => {
+    if (checkAdminAuth(req)) {
+        return res.redirect("/admin");
+    }
+    res.render("login", { error: undefined });
 });
 
-// Iniciar o servidor (para ambiente de desenvolvimento ou se não estiver usando Vercel serverless)
+// Rota de login (POST)
+app.post("/admin/login", (req, res) => {
+    const { username, password } = req.body;
+    if (username === ADMIN_USER && password === ADMIN_PASS) {
+        // Gerar novo token de sessão admin e setar cookie
+        adminToken = crypto.randomBytes(16).toString('hex');
+        res.cookie("adminAuth", adminToken, { httpOnly: true, path: "/admin" });
+        return res.redirect("/admin");
+    }
+    res.render("login", { error: "Credenciais inválidas. Tente novamente." });
+});
+
+// Rota principal do painel (dashboard)
+app.get("/admin", async (req, res) => {
+    if (!checkAdminAuth(req)) {
+        return res.redirect("/admin/login");
+    }
+    try {
+        const leadsDir = path.join(__dirname, 'leads');
+        fs.mkdirSync(leadsDir, { recursive: true });
+        const files = fs.readdirSync(leadsDir);
+        const participants = [];
+        for (const file of files) {
+            if (file.endsWith(".json")) {
+                const content = fs.readFileSync(path.join(leadsDir, file), "utf-8");
+                participants.push(JSON.parse(content));
+            }
+        }
+        const totalParticipants = participants.length;
+        const totalQuestions = participants.reduce((sum, p) => sum + (p.questionsCount || 0), 0);
+        const interactionsByHour = {};
+        participants.forEach(p => {
+            if (p.startTime) {
+                const d = new Date(p.startTime);
+                const hourKey = d.getFullYear() + "-" +
+                                String(d.getMonth() + 1).padStart(2, '0') + "-" +
+                                String(d.getDate()).padStart(2, '0') + " " +
+                                String(d.getHours()).padStart(2, '0') + ":00";
+                interactionsByHour[hourKey] = (interactionsByHour[hourKey] || 0) + 1;
+            }
+        });
+        const interactionsArray = Object.entries(interactionsByHour).sort();
+        res.render("dashboard", { 
+            participants, 
+            totalParticipants, 
+            totalQuestions, 
+            interactionsArray 
+        });
+    } catch (err) {
+        console.error("[ADMIN_PANEL_ERROR] Erro ao carregar painel:", err);
+        res.status(500).send("Erro ao carregar painel administrativo.");
+    }
+});
+
+// Rota para visualizar carta completa de um participante
+app.get("/admin/letter/:phone", async (req, res) => {
+    if (!checkAdminAuth(req)) {
+        return res.redirect("/admin/login");
+    }
+    const phone = req.params.phone;
+    try {
+        const filePath = path.join(__dirname, 'leads', `${phone}.json`);
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).send("Carta não encontrada.");
+        }
+        const content = fs.readFileSync(filePath, "utf-8");
+        const participant = JSON.parse(content);
+        res.render("letter", { participant });
+    } catch (err) {
+        console.error("[ADMIN_LETTER_ERROR] Erro ao carregar carta:", err);
+        res.status(500).send("Erro ao carregar carta.");
+    }
+});
+
+// Rota para exportar CSV de participantes
+app.get("/admin/export", (req, res) => {
+    if (!checkAdminAuth(req)) {
+        return res.redirect("/admin/login");
+    }
+    try {
+        const leadsDir = path.join(__dirname, 'leads');
+        fs.mkdirSync(leadsDir, { recursive: true });
+        const files = fs.readdirSync(leadsDir);
+        let csv = "Nome,Telefone,E-mail,Instagram,ConcluidoEm,Perguntas\n";
+        for (const file of files) {
+            if (!file.endsWith(".json")) continue;
+            const data = JSON.parse(fs.readFileSync(path.join(leadsDir, file), "utf-8"));
+            const dateStr = new Date(data.completionTime).toLocaleString('pt-BR');
+            const esc = (val) => `"${String(val).replace(/"/g, '""')}"`;
+            csv += [
+                esc(data.name),
+                esc(data.phone),
+                esc(data.email || ""),
+                esc(data.instagram || ""),
+                esc(dateStr),
+                esc(data.questionsCount || 0)
+            ].join(",") + "\n";
+        }
+        res.setHeader("Content-Type", "text/csv");
+        res.setHeader("Content-Disposition", 'attachment; filename="leads.csv"');
+        res.send(csv);
+    } catch (err) {
+        console.error("[CSV_EXPORT_ERROR] Erro ao exportar CSV:", err);
+        res.status(500).send("Erro ao exportar CSV.");
+    }
+});
+
+// Rota de logout do painel
+app.get("/admin/logout", (req, res) => {
+    res.clearCookie("adminAuth", { path: "/admin" });
+    res.redirect("/admin/login");
+});
+
+// Iniciar o servidor
 if (require.main === module) {
     app.listen(PORT, () => {
         console.log(`[SERVER_START] Servidor Node.js escutando na porta ${PORT}`);
@@ -934,5 +1119,4 @@ if (require.main === module) {
     });
 }
 
-// Exportar o app (para permitir uso em ambientes serverless da Vercel, por exemplo)
 module.exports = app;

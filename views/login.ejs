@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>Login – Painel Consciênc.IA</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+  <div class="bg-white p-8 rounded shadow-md w-80">
+    <h1 class="text-2xl font-bold mb-4 text-center">Painel Administrativo</h1>
+    <% if (typeof error !== "undefined" && error) { %>
+      <p class="text-red-500 text-sm mb-4"><%= error %></p>
+    <% } %>
+    <form method="POST" action="/admin/login" class="flex flex-col">
+      <input type="text" name="username" placeholder="Usuário" class="mb-3 p-2 border rounded" required>
+      <input type="password" name="password" placeholder="Senha" class="mb-4 p-2 border rounded" required>
+      <button type="submit" class="bg-blue-600 text-white py-2 rounded hover:bg-blue-700">Entrar</button>
+    </form>
+  </div>
+</body>
+</html>

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>Carta de Consciência – <%= participant.name %></title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-6 font-sans">
+  <h1 class="text-2xl font-bold mb-4">Carta de Consciência de <%= participant.name %></h1>
+  <div class="bg-white p-4 rounded shadow">
+    <div class="prose prose-sm prose-gray">
+      <%= participant.letter
+            .replace(/https?:\/\/\S+/g, function(url) {
+                return '<a href="' + url + '" target="_blank" class="text-blue-600 underline">' + url + '</a>';
+            })
+            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+            .replace(/\*(.*?)\*/g, '<em>$1</em>') %>
+    </div>
+  </div>
+  <div class="mt-4">
+    <a href="/admin" class="text-blue-600 hover:underline">← Voltar ao Dashboard</a>
+  </div>
+</body>
+</html>

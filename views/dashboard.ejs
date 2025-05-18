@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>Dashboard – Painel Consciênc.IA</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 font-sans">
+  <div class="p-6">
+    <h1 class="text-3xl font-bold mb-6">Dashboard do Evento</h1>
+    <div class="mb-6">
+      <p><strong>Total de Participantes:</strong> <%= totalParticipants %></p>
+      <p><strong>Perguntas Recebidas (após cartas):</strong> <%= totalQuestions %></p>
+      <div class="mt-4">
+        <h2 class="font-semibold mb-1">Interações por Hora:</h2>
+        <ul class="list-disc list-inside text-gray-800">
+          <% interactionsArray.forEach(function(item) { %>
+            <li><%= item[0] %>: <%= item[1] %> interação(ões)</li>
+          <% }) %>
+        </ul>
+      </div>
+    </div>
+    <div class="flex justify-between items-center mb-4">
+      <h2 class="text-2xl font-semibold">Participantes</h2>
+      <a href="/admin/export" class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700">Exportar CSV</a>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="min-w-full bg-white shadow-md rounded overflow-hidden">
+        <thead class="bg-gray-200">
+          <tr>
+            <th class="text-left px-4 py-2">Nome</th>
+            <th class="text-left px-4 py-2">Telefone</th>
+            <th class="text-left px-4 py-2">E-mail</th>
+            <th class="text-left px-4 py-2">Instagram</th>
+            <th class="text-left px-4 py-2">Concluído em</th>
+            <th class="px-4 py-2 text-center">Carta</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% participants.forEach(function(p) { %>
+            <tr class="border-b hover:bg-gray-50">
+              <td class="px-4 py-2"><%= p.name %></td>
+              <td class="px-4 py-2"><%= p.phone %></td>
+              <td class="px-4 py-2"><%= p.email || '' %></td>
+              <td class="px-4 py-2"><%= p.instagram || '' %></td>
+              <td class="px-4 py-2"><%= new Date(p.completionTime).toLocaleString('pt-BR') %></td>
+              <td class="px-4 py-2 text-center">
+                <a href="/admin/letter/<%= p.phone %>" class="text-blue-600 hover:underline">Ver</a>
+              </td>
+            </tr>
+          <% }) %>
+        </tbody>
+      </table>
+    </div>
+    <div class="mt-6">
+      <a href="/admin/logout" class="text-gray-600 hover:underline">Sair</a>
+    </div>
+  </div>
+</body>
+</html>
